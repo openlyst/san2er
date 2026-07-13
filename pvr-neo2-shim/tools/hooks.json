@@ -1,0 +1,7 @@
+[
+  "Pvr_Init",
+  "Pvr_ChangeScreenParameters",
+  "Pvr_SetInitActivity",
+  "Pvr_SetCurrentHMDType",
+  "Pvr_GetSupportHMDTypes"
+]
