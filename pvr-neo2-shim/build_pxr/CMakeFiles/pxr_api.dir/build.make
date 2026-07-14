@@ -76,15 +76,15 @@ CMakeFiles/pxr_api.dir/src/pxr_api_shim.c.o: CMakeFiles/pxr_api.dir/flags.make
 CMakeFiles/pxr_api.dir/src/pxr_api_shim.c.o: /home/calico/san2er/pvr-neo2-shim/src/pxr_api_shim.c
 CMakeFiles/pxr_api.dir/src/pxr_api_shim.c.o: CMakeFiles/pxr_api.dir/compiler_depend.ts
 	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir=/home/calico/san2er/pvr-neo2-shim/build_pxr/CMakeFiles --progress-num=$(CMAKE_PROGRESS_1) "Building C object CMakeFiles/pxr_api.dir/src/pxr_api_shim.c.o"
-	/opt/android-sdk/ndk/27.0.12077973/toolchains/llvm/prebuilt/linux-x86_64/bin/clang --target=aarch64-none-linux-android27 --sysroot=/opt/android-sdk/ndk/27.0.12077973/toolchains/llvm/prebuilt/linux-x86_64/sysroot $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT CMakeFiles/pxr_api.dir/src/pxr_api_shim.c.o -MF CMakeFiles/pxr_api.dir/src/pxr_api_shim.c.o.d -o CMakeFiles/pxr_api.dir/src/pxr_api_shim.c.o -c /home/calico/san2er/pvr-neo2-shim/src/pxr_api_shim.c
+	/opt/android-sdk/ndk/25.1.8937393/toolchains/llvm/prebuilt/linux-x86_64/bin/clang --target=aarch64-none-linux-android28 --sysroot=/opt/android-sdk/ndk/25.1.8937393/toolchains/llvm/prebuilt/linux-x86_64/sysroot $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT CMakeFiles/pxr_api.dir/src/pxr_api_shim.c.o -MF CMakeFiles/pxr_api.dir/src/pxr_api_shim.c.o.d -o CMakeFiles/pxr_api.dir/src/pxr_api_shim.c.o -c /home/calico/san2er/pvr-neo2-shim/src/pxr_api_shim.c
 
 CMakeFiles/pxr_api.dir/src/pxr_api_shim.c.i: cmake_force
 	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Preprocessing C source to CMakeFiles/pxr_api.dir/src/pxr_api_shim.c.i"
-	/opt/android-sdk/ndk/27.0.12077973/toolchains/llvm/prebuilt/linux-x86_64/bin/clang --target=aarch64-none-linux-android27 --sysroot=/opt/android-sdk/ndk/27.0.12077973/toolchains/llvm/prebuilt/linux-x86_64/sysroot $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -E /home/calico/san2er/pvr-neo2-shim/src/pxr_api_shim.c > CMakeFiles/pxr_api.dir/src/pxr_api_shim.c.i
+	/opt/android-sdk/ndk/25.1.8937393/toolchains/llvm/prebuilt/linux-x86_64/bin/clang --target=aarch64-none-linux-android28 --sysroot=/opt/android-sdk/ndk/25.1.8937393/toolchains/llvm/prebuilt/linux-x86_64/sysroot $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -E /home/calico/san2er/pvr-neo2-shim/src/pxr_api_shim.c > CMakeFiles/pxr_api.dir/src/pxr_api_shim.c.i
 
 CMakeFiles/pxr_api.dir/src/pxr_api_shim.c.s: cmake_force
 	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Compiling C source to assembly CMakeFiles/pxr_api.dir/src/pxr_api_shim.c.s"
-	/opt/android-sdk/ndk/27.0.12077973/toolchains/llvm/prebuilt/linux-x86_64/bin/clang --target=aarch64-none-linux-android27 --sysroot=/opt/android-sdk/ndk/27.0.12077973/toolchains/llvm/prebuilt/linux-x86_64/sysroot $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -S /home/calico/san2er/pvr-neo2-shim/src/pxr_api_shim.c -o CMakeFiles/pxr_api.dir/src/pxr_api_shim.c.s
+	/opt/android-sdk/ndk/25.1.8937393/toolchains/llvm/prebuilt/linux-x86_64/bin/clang --target=aarch64-none-linux-android28 --sysroot=/opt/android-sdk/ndk/25.1.8937393/toolchains/llvm/prebuilt/linux-x86_64/sysroot $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -S /home/calico/san2er/pvr-neo2-shim/src/pxr_api_shim.c -o CMakeFiles/pxr_api.dir/src/pxr_api_shim.c.s
 
 # Object files for target pxr_api
 pxr_api_OBJECTS = \
@@ -96,10 +96,10 @@ pxr_api_EXTERNAL_OBJECTS =
 libpxr_api.so: CMakeFiles/pxr_api.dir/src/pxr_api_shim.c.o
 libpxr_api.so: CMakeFiles/pxr_api.dir/build.make
 libpxr_api.so: CMakeFiles/pxr_api.dir/compiler_depend.ts
-libpxr_api.so: /opt/android-sdk/ndk/27.0.12077973/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/27/liblog.so
-libpxr_api.so: /opt/android-sdk/ndk/27.0.12077973/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/27/libdl.so
-libpxr_api.so: /opt/android-sdk/ndk/27.0.12077973/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/27/libEGL.so
-libpxr_api.so: /opt/android-sdk/ndk/27.0.12077973/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/27/libGLESv2.so
+libpxr_api.so: /opt/android-sdk/ndk/25.1.8937393/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/28/liblog.so
+libpxr_api.so: /opt/android-sdk/ndk/25.1.8937393/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/28/libdl.so
+libpxr_api.so: /opt/android-sdk/ndk/25.1.8937393/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/28/libEGL.so
+libpxr_api.so: /opt/android-sdk/ndk/25.1.8937393/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/28/libGLESv3.so
 libpxr_api.so: CMakeFiles/pxr_api.dir/link.txt
 	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --bold --progress-dir=/home/calico/san2er/pvr-neo2-shim/build_pxr/CMakeFiles --progress-num=$(CMAKE_PROGRESS_2) "Linking C shared library libpxr_api.so"
 	$(CMAKE_COMMAND) -E cmake_link_script CMakeFiles/pxr_api.dir/link.txt --verbose=$(VERBOSE)

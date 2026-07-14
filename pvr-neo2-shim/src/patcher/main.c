@@ -229,6 +229,18 @@ static int inject_shim_pxr(const char *decoded_dir, const char *shim_path,
         printf("[patch] added libPvr_UnitySDK.so (PVR SDK compat library)\n");
     }
 
+    /* Copy lib6DofReset.so into the APK. The compat library's pvr_OnLoad
+       needs updateOffsets/getResetPos from it, but can't dlopen the system
+       copy due to Android namespace restrictions. */
+    char dofreset_src[1024], dofreset_dst[1024];
+    snprintf(dofreset_src, sizeof(dofreset_src), "%s/prebuilt/lib6DofReset.so", shim_src);
+    snprintf(dofreset_dst, sizeof(dofreset_dst), "%s/lib/arm64-v8a/lib6DofReset.so", decoded_dir);
+    if (stat(dofreset_src, &st) == 0) {
+        const char *cp_dof[] = { "cp", dofreset_src, dofreset_dst, NULL };
+        if (run_cmd(cp_dof) < 0) return -1;
+        printf("[patch] added lib6DofReset.so\n");
+    }
+
     return 0;
 }
 
@@ -434,6 +446,34 @@ int main(int argc, char **argv) {
     if (run_cmd(build_cmd) < 0) {
         fprintf(stderr, "apktool build failed\n");
         return 1;
+    }
+
+    /* For PXR Platform games: add classes2.dex with VrActivity stub
+       so check6DofAppResume() returns true and StartXR gets triggered */
+    if (apk_type == APK_TYPE_PXR_PLATFORM) {
+        char dex_src[1024];
+        snprintf(dex_src, sizeof(dex_src), "%s/prebuilt/classes2.dex", shim_src);
+        struct stat dst;
+        if (stat(dex_src, &dst) == 0) {
+            const char *zip_cmd[] = {
+                "zip", "-j", unsigned_apk, dex_src, NULL,
+            };
+            /* zip -j strips directory, but we need it named classes2.dex */
+            /* use a two-step: copy then zip with proper name */
+            char tmp_dex[1024];
+            snprintf(tmp_dex, sizeof(tmp_dex), "%s/classes2.dex", work_dir);
+            const char *cp_dex[] = { "cp", dex_src, tmp_dex, NULL };
+            run_cmd(cp_dex);
+            char zip_cmd2[2048];
+            snprintf(zip_cmd2, sizeof(zip_cmd2),
+                     "cd %s && zip %s classes2.dex", work_dir, unsigned_apk);
+            int rc = system(zip_cmd2);
+            if (rc == 0) {
+                printf("[patch] added classes2.dex (VrActivity stub)\n");
+            } else {
+                fprintf(stderr, "warning: failed to add classes2.dex\n");
+            }
+        }
     }
 
     /* step 8: zipalign */

@@ -14,7 +14,8 @@ target_include_directories(Pvr_UnitySDK PRIVATE src)
 find_library(log-lib log)
 find_library(dl-lib dl)
 find_library(egl-lib EGL)
-find_library(gles-lib GLESv2)
+find_library(gles-lib GLESv3)
+find_library(gles2-lib GLESv2)
 
 target_link_libraries(Pvr_UnitySDK ${log-lib} ${dl-lib})
 

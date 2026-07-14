@@ -76,56 +76,56 @@ CMakeFiles/Pvr_UnitySDK.dir/src/loader.cpp.o: CMakeFiles/Pvr_UnitySDK.dir/flags.
 CMakeFiles/Pvr_UnitySDK.dir/src/loader.cpp.o: /home/calico/san2er/pvr-neo2-shim/src/loader.cpp
 CMakeFiles/Pvr_UnitySDK.dir/src/loader.cpp.o: CMakeFiles/Pvr_UnitySDK.dir/compiler_depend.ts
 	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir=/home/calico/san2er/pvr-neo2-shim/build_pxr/CMakeFiles --progress-num=$(CMAKE_PROGRESS_1) "Building CXX object CMakeFiles/Pvr_UnitySDK.dir/src/loader.cpp.o"
-	/opt/android-sdk/ndk/27.0.12077973/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++ --target=aarch64-none-linux-android27 --sysroot=/opt/android-sdk/ndk/27.0.12077973/toolchains/llvm/prebuilt/linux-x86_64/sysroot $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -MD -MT CMakeFiles/Pvr_UnitySDK.dir/src/loader.cpp.o -MF CMakeFiles/Pvr_UnitySDK.dir/src/loader.cpp.o.d -o CMakeFiles/Pvr_UnitySDK.dir/src/loader.cpp.o -c /home/calico/san2er/pvr-neo2-shim/src/loader.cpp
+	/opt/android-sdk/ndk/25.1.8937393/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++ --target=aarch64-none-linux-android28 --sysroot=/opt/android-sdk/ndk/25.1.8937393/toolchains/llvm/prebuilt/linux-x86_64/sysroot $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -MD -MT CMakeFiles/Pvr_UnitySDK.dir/src/loader.cpp.o -MF CMakeFiles/Pvr_UnitySDK.dir/src/loader.cpp.o.d -o CMakeFiles/Pvr_UnitySDK.dir/src/loader.cpp.o -c /home/calico/san2er/pvr-neo2-shim/src/loader.cpp
 
 CMakeFiles/Pvr_UnitySDK.dir/src/loader.cpp.i: cmake_force
 	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Preprocessing CXX source to CMakeFiles/Pvr_UnitySDK.dir/src/loader.cpp.i"
-	/opt/android-sdk/ndk/27.0.12077973/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++ --target=aarch64-none-linux-android27 --sysroot=/opt/android-sdk/ndk/27.0.12077973/toolchains/llvm/prebuilt/linux-x86_64/sysroot $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -E /home/calico/san2er/pvr-neo2-shim/src/loader.cpp > CMakeFiles/Pvr_UnitySDK.dir/src/loader.cpp.i
+	/opt/android-sdk/ndk/25.1.8937393/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++ --target=aarch64-none-linux-android28 --sysroot=/opt/android-sdk/ndk/25.1.8937393/toolchains/llvm/prebuilt/linux-x86_64/sysroot $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -E /home/calico/san2er/pvr-neo2-shim/src/loader.cpp > CMakeFiles/Pvr_UnitySDK.dir/src/loader.cpp.i
 
 CMakeFiles/Pvr_UnitySDK.dir/src/loader.cpp.s: cmake_force
 	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Compiling CXX source to assembly CMakeFiles/Pvr_UnitySDK.dir/src/loader.cpp.s"
-	/opt/android-sdk/ndk/27.0.12077973/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++ --target=aarch64-none-linux-android27 --sysroot=/opt/android-sdk/ndk/27.0.12077973/toolchains/llvm/prebuilt/linux-x86_64/sysroot $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -S /home/calico/san2er/pvr-neo2-shim/src/loader.cpp -o CMakeFiles/Pvr_UnitySDK.dir/src/loader.cpp.s
+	/opt/android-sdk/ndk/25.1.8937393/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++ --target=aarch64-none-linux-android28 --sysroot=/opt/android-sdk/ndk/25.1.8937393/toolchains/llvm/prebuilt/linux-x86_64/sysroot $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -S /home/calico/san2er/pvr-neo2-shim/src/loader.cpp -o CMakeFiles/Pvr_UnitySDK.dir/src/loader.cpp.s
 
 CMakeFiles/Pvr_UnitySDK.dir/src/hooks.cpp.o: CMakeFiles/Pvr_UnitySDK.dir/flags.make
 CMakeFiles/Pvr_UnitySDK.dir/src/hooks.cpp.o: /home/calico/san2er/pvr-neo2-shim/src/hooks.cpp
 CMakeFiles/Pvr_UnitySDK.dir/src/hooks.cpp.o: CMakeFiles/Pvr_UnitySDK.dir/compiler_depend.ts
 	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir=/home/calico/san2er/pvr-neo2-shim/build_pxr/CMakeFiles --progress-num=$(CMAKE_PROGRESS_2) "Building CXX object CMakeFiles/Pvr_UnitySDK.dir/src/hooks.cpp.o"
-	/opt/android-sdk/ndk/27.0.12077973/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++ --target=aarch64-none-linux-android27 --sysroot=/opt/android-sdk/ndk/27.0.12077973/toolchains/llvm/prebuilt/linux-x86_64/sysroot $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -MD -MT CMakeFiles/Pvr_UnitySDK.dir/src/hooks.cpp.o -MF CMakeFiles/Pvr_UnitySDK.dir/src/hooks.cpp.o.d -o CMakeFiles/Pvr_UnitySDK.dir/src/hooks.cpp.o -c /home/calico/san2er/pvr-neo2-shim/src/hooks.cpp
+	/opt/android-sdk/ndk/25.1.8937393/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++ --target=aarch64-none-linux-android28 --sysroot=/opt/android-sdk/ndk/25.1.8937393/toolchains/llvm/prebuilt/linux-x86_64/sysroot $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -MD -MT CMakeFiles/Pvr_UnitySDK.dir/src/hooks.cpp.o -MF CMakeFiles/Pvr_UnitySDK.dir/src/hooks.cpp.o.d -o CMakeFiles/Pvr_UnitySDK.dir/src/hooks.cpp.o -c /home/calico/san2er/pvr-neo2-shim/src/hooks.cpp
 
 CMakeFiles/Pvr_UnitySDK.dir/src/hooks.cpp.i: cmake_force
 	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Preprocessing CXX source to CMakeFiles/Pvr_UnitySDK.dir/src/hooks.cpp.i"
-	/opt/android-sdk/ndk/27.0.12077973/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++ --target=aarch64-none-linux-android27 --sysroot=/opt/android-sdk/ndk/27.0.12077973/toolchains/llvm/prebuilt/linux-x86_64/sysroot $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -E /home/calico/san2er/pvr-neo2-shim/src/hooks.cpp > CMakeFiles/Pvr_UnitySDK.dir/src/hooks.cpp.i
+	/opt/android-sdk/ndk/25.1.8937393/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++ --target=aarch64-none-linux-android28 --sysroot=/opt/android-sdk/ndk/25.1.8937393/toolchains/llvm/prebuilt/linux-x86_64/sysroot $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -E /home/calico/san2er/pvr-neo2-shim/src/hooks.cpp > CMakeFiles/Pvr_UnitySDK.dir/src/hooks.cpp.i
 
 CMakeFiles/Pvr_UnitySDK.dir/src/hooks.cpp.s: cmake_force
 	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Compiling CXX source to assembly CMakeFiles/Pvr_UnitySDK.dir/src/hooks.cpp.s"
-	/opt/android-sdk/ndk/27.0.12077973/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++ --target=aarch64-none-linux-android27 --sysroot=/opt/android-sdk/ndk/27.0.12077973/toolchains/llvm/prebuilt/linux-x86_64/sysroot $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -S /home/calico/san2er/pvr-neo2-shim/src/hooks.cpp -o CMakeFiles/Pvr_UnitySDK.dir/src/hooks.cpp.s
+	/opt/android-sdk/ndk/25.1.8937393/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++ --target=aarch64-none-linux-android28 --sysroot=/opt/android-sdk/ndk/25.1.8937393/toolchains/llvm/prebuilt/linux-x86_64/sysroot $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -S /home/calico/san2er/pvr-neo2-shim/src/hooks.cpp -o CMakeFiles/Pvr_UnitySDK.dir/src/hooks.cpp.s
 
 CMakeFiles/Pvr_UnitySDK.dir/src/generated/forward_stubs.S.o: CMakeFiles/Pvr_UnitySDK.dir/flags.make
 CMakeFiles/Pvr_UnitySDK.dir/src/generated/forward_stubs.S.o: /home/calico/san2er/pvr-neo2-shim/src/generated/forward_stubs.S
 	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir=/home/calico/san2er/pvr-neo2-shim/build_pxr/CMakeFiles --progress-num=$(CMAKE_PROGRESS_3) "Building ASM object CMakeFiles/Pvr_UnitySDK.dir/src/generated/forward_stubs.S.o"
-	/opt/android-sdk/ndk/27.0.12077973/toolchains/llvm/prebuilt/linux-x86_64/bin/clang -target aarch64-none-linux-android27 --sysroot=/opt/android-sdk/ndk/27.0.12077973/toolchains/llvm/prebuilt/linux-x86_64/sysroot $(ASM_DEFINES) $(ASM_INCLUDES) $(ASM_FLAGS) -o CMakeFiles/Pvr_UnitySDK.dir/src/generated/forward_stubs.S.o -c /home/calico/san2er/pvr-neo2-shim/src/generated/forward_stubs.S
+	/opt/android-sdk/ndk/25.1.8937393/toolchains/llvm/prebuilt/linux-x86_64/bin/clang -target aarch64-none-linux-android28 --sysroot=/opt/android-sdk/ndk/25.1.8937393/toolchains/llvm/prebuilt/linux-x86_64/sysroot $(ASM_DEFINES) $(ASM_INCLUDES) $(ASM_FLAGS) -o CMakeFiles/Pvr_UnitySDK.dir/src/generated/forward_stubs.S.o -c /home/calico/san2er/pvr-neo2-shim/src/generated/forward_stubs.S
 
 CMakeFiles/Pvr_UnitySDK.dir/src/generated/forward_stubs.S.i: cmake_force
 	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Preprocessing ASM source to CMakeFiles/Pvr_UnitySDK.dir/src/generated/forward_stubs.S.i"
-	/opt/android-sdk/ndk/27.0.12077973/toolchains/llvm/prebuilt/linux-x86_64/bin/clang -target aarch64-none-linux-android27 --sysroot=/opt/android-sdk/ndk/27.0.12077973/toolchains/llvm/prebuilt/linux-x86_64/sysroot $(ASM_DEFINES) $(ASM_INCLUDES) $(ASM_FLAGS) -E /home/calico/san2er/pvr-neo2-shim/src/generated/forward_stubs.S > CMakeFiles/Pvr_UnitySDK.dir/src/generated/forward_stubs.S.i
+	/opt/android-sdk/ndk/25.1.8937393/toolchains/llvm/prebuilt/linux-x86_64/bin/clang -target aarch64-none-linux-android28 --sysroot=/opt/android-sdk/ndk/25.1.8937393/toolchains/llvm/prebuilt/linux-x86_64/sysroot $(ASM_DEFINES) $(ASM_INCLUDES) $(ASM_FLAGS) -E /home/calico/san2er/pvr-neo2-shim/src/generated/forward_stubs.S > CMakeFiles/Pvr_UnitySDK.dir/src/generated/forward_stubs.S.i
 
 CMakeFiles/Pvr_UnitySDK.dir/src/generated/forward_stubs.S.s: cmake_force
 	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Compiling ASM source to assembly CMakeFiles/Pvr_UnitySDK.dir/src/generated/forward_stubs.S.s"
-	/opt/android-sdk/ndk/27.0.12077973/toolchains/llvm/prebuilt/linux-x86_64/bin/clang -target aarch64-none-linux-android27 --sysroot=/opt/android-sdk/ndk/27.0.12077973/toolchains/llvm/prebuilt/linux-x86_64/sysroot $(ASM_DEFINES) $(ASM_INCLUDES) $(ASM_FLAGS) -S /home/calico/san2er/pvr-neo2-shim/src/generated/forward_stubs.S -o CMakeFiles/Pvr_UnitySDK.dir/src/generated/forward_stubs.S.s
+	/opt/android-sdk/ndk/25.1.8937393/toolchains/llvm/prebuilt/linux-x86_64/bin/clang -target aarch64-none-linux-android28 --sysroot=/opt/android-sdk/ndk/25.1.8937393/toolchains/llvm/prebuilt/linux-x86_64/sysroot $(ASM_DEFINES) $(ASM_INCLUDES) $(ASM_FLAGS) -S /home/calico/san2er/pvr-neo2-shim/src/generated/forward_stubs.S -o CMakeFiles/Pvr_UnitySDK.dir/src/generated/forward_stubs.S.s
 
 CMakeFiles/Pvr_UnitySDK.dir/src/generated/forward_vars.cpp.o: CMakeFiles/Pvr_UnitySDK.dir/flags.make
 CMakeFiles/Pvr_UnitySDK.dir/src/generated/forward_vars.cpp.o: /home/calico/san2er/pvr-neo2-shim/src/generated/forward_vars.cpp
 CMakeFiles/Pvr_UnitySDK.dir/src/generated/forward_vars.cpp.o: CMakeFiles/Pvr_UnitySDK.dir/compiler_depend.ts
 	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir=/home/calico/san2er/pvr-neo2-shim/build_pxr/CMakeFiles --progress-num=$(CMAKE_PROGRESS_4) "Building CXX object CMakeFiles/Pvr_UnitySDK.dir/src/generated/forward_vars.cpp.o"
-	/opt/android-sdk/ndk/27.0.12077973/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++ --target=aarch64-none-linux-android27 --sysroot=/opt/android-sdk/ndk/27.0.12077973/toolchains/llvm/prebuilt/linux-x86_64/sysroot $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -MD -MT CMakeFiles/Pvr_UnitySDK.dir/src/generated/forward_vars.cpp.o -MF CMakeFiles/Pvr_UnitySDK.dir/src/generated/forward_vars.cpp.o.d -o CMakeFiles/Pvr_UnitySDK.dir/src/generated/forward_vars.cpp.o -c /home/calico/san2er/pvr-neo2-shim/src/generated/forward_vars.cpp
+	/opt/android-sdk/ndk/25.1.8937393/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++ --target=aarch64-none-linux-android28 --sysroot=/opt/android-sdk/ndk/25.1.8937393/toolchains/llvm/prebuilt/linux-x86_64/sysroot $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -MD -MT CMakeFiles/Pvr_UnitySDK.dir/src/generated/forward_vars.cpp.o -MF CMakeFiles/Pvr_UnitySDK.dir/src/generated/forward_vars.cpp.o.d -o CMakeFiles/Pvr_UnitySDK.dir/src/generated/forward_vars.cpp.o -c /home/calico/san2er/pvr-neo2-shim/src/generated/forward_vars.cpp
 
 CMakeFiles/Pvr_UnitySDK.dir/src/generated/forward_vars.cpp.i: cmake_force
 	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Preprocessing CXX source to CMakeFiles/Pvr_UnitySDK.dir/src/generated/forward_vars.cpp.i"
-	/opt/android-sdk/ndk/27.0.12077973/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++ --target=aarch64-none-linux-android27 --sysroot=/opt/android-sdk/ndk/27.0.12077973/toolchains/llvm/prebuilt/linux-x86_64/sysroot $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -E /home/calico/san2er/pvr-neo2-shim/src/generated/forward_vars.cpp > CMakeFiles/Pvr_UnitySDK.dir/src/generated/forward_vars.cpp.i
+	/opt/android-sdk/ndk/25.1.8937393/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++ --target=aarch64-none-linux-android28 --sysroot=/opt/android-sdk/ndk/25.1.8937393/toolchains/llvm/prebuilt/linux-x86_64/sysroot $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -E /home/calico/san2er/pvr-neo2-shim/src/generated/forward_vars.cpp > CMakeFiles/Pvr_UnitySDK.dir/src/generated/forward_vars.cpp.i
 
 CMakeFiles/Pvr_UnitySDK.dir/src/generated/forward_vars.cpp.s: cmake_force
 	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Compiling CXX source to assembly CMakeFiles/Pvr_UnitySDK.dir/src/generated/forward_vars.cpp.s"
-	/opt/android-sdk/ndk/27.0.12077973/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++ --target=aarch64-none-linux-android27 --sysroot=/opt/android-sdk/ndk/27.0.12077973/toolchains/llvm/prebuilt/linux-x86_64/sysroot $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -S /home/calico/san2er/pvr-neo2-shim/src/generated/forward_vars.cpp -o CMakeFiles/Pvr_UnitySDK.dir/src/generated/forward_vars.cpp.s
+	/opt/android-sdk/ndk/25.1.8937393/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++ --target=aarch64-none-linux-android28 --sysroot=/opt/android-sdk/ndk/25.1.8937393/toolchains/llvm/prebuilt/linux-x86_64/sysroot $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -S /home/calico/san2er/pvr-neo2-shim/src/generated/forward_vars.cpp -o CMakeFiles/Pvr_UnitySDK.dir/src/generated/forward_vars.cpp.s
 
 # Object files for target Pvr_UnitySDK
 Pvr_UnitySDK_OBJECTS = \
@@ -143,8 +143,8 @@ libPvr_UnitySDK.so: CMakeFiles/Pvr_UnitySDK.dir/src/generated/forward_stubs.S.o
 libPvr_UnitySDK.so: CMakeFiles/Pvr_UnitySDK.dir/src/generated/forward_vars.cpp.o
 libPvr_UnitySDK.so: CMakeFiles/Pvr_UnitySDK.dir/build.make
 libPvr_UnitySDK.so: CMakeFiles/Pvr_UnitySDK.dir/compiler_depend.ts
-libPvr_UnitySDK.so: /opt/android-sdk/ndk/27.0.12077973/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/27/liblog.so
-libPvr_UnitySDK.so: /opt/android-sdk/ndk/27.0.12077973/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/27/libdl.so
+libPvr_UnitySDK.so: /opt/android-sdk/ndk/25.1.8937393/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/28/liblog.so
+libPvr_UnitySDK.so: /opt/android-sdk/ndk/25.1.8937393/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/28/libdl.so
 libPvr_UnitySDK.so: CMakeFiles/Pvr_UnitySDK.dir/link.txt
 	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --bold --progress-dir=/home/calico/san2er/pvr-neo2-shim/build_pxr/CMakeFiles --progress-num=$(CMAKE_PROGRESS_5) "Linking CXX shared library libPvr_UnitySDK.so"
 	$(CMAKE_COMMAND) -E cmake_link_script CMakeFiles/Pvr_UnitySDK.dir/link.txt --verbose=$(VERBOSE)

@@ -17,6 +17,7 @@
 #include <EGL/egl.h>
 #include <GLES3/gl3.h>
 #include <GLES2/gl2ext.h>
+#include <unwind.h>
 
 #define TAG "pxr_api_shim"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
@@ -111,19 +112,27 @@ static int g_fov_cached = 0;
 #define RENDER_EVENT_BOUNDARY_RIGHT      1035
 #define RENDER_EVENT_BOTH_EYE_END_FRAME  1036
 
-/* ---- PVR config enum values (from Pvr_UnitySDKAPI.cs) ---- */
-enum pvr_config {
-    PVR_CFG_FOV              = 0,
-    PVR_CFG_HFOV             = 1,
-    PVR_CFG_EYE_BUFFER_W     = 2,
-    PVR_CFG_EYE_BUFFER_H     = 3,
-    PVR_CFG_TARGET_FPS       = 4,
-    PVR_CFG_IPD              = 5,
-    PVR_CFG_NECK_X           = 6,
-    PVR_CFG_NECK_Y           = 7,
-    PVR_CFG_NECK_Z           = 8,
-    PVR_CFG_PLATFORM_TYPE    = 9,
-    PVR_CFG_DISPLAY_RATE     = 10,
+/* ---- PVR config enum values (from Pvr_UnitySDKAPI.cs GlobalIntConfigs/GlobalFloatConfigs) ---- */
+enum pvr_int_config {
+    PVR_ICFG_EYE_TEX_RES0     = 0,  /* EYE_TEXTURE_RESOLUTION0 */
+    PVR_ICFG_EYE_TEX_RES1     = 1,  /* EYE_TEXTURE_RESOLUTION1 */
+    PVR_ICFG_SENSOR_COUNT     = 2,
+    PVR_ICFG_6DOF             = 3,
+    PVR_ICFG_PLATFORM_TYPE    = 4,
+    PVR_ICFG_TRACKING_MODE    = 5,
+    PVR_ICFG_TARGET_FPS       = 9,
+    PVR_ICFG_SHOW_FPS         = 10,
+    PVR_ICFG_AA_LEVEL         = 25,
+};
+
+enum pvr_float_config {
+    PVR_FCFG_IPD              = 0,
+    PVR_FCFG_VFOV             = 1,
+    PVR_FCFG_HFOV             = 2,
+    PVR_FCFG_NECK_X           = 3,
+    PVR_FCFG_NECK_Y           = 4,
+    PVR_FCFG_NECK_Z           = 5,
+    PVR_FCFG_DISPLAY_RATE     = 6,
 };
 
 /* ---- PXR ConfigType enum (from PXR_Plugin.cs) ---- */
@@ -152,6 +161,48 @@ static int load_pvr_runtime() {
         return -1;
     }
     LOGI("loaded libPvr_UnitySDK_compat.so (PVR SDK compat)");
+
+    /* Call pvr_OnLoad to initialize the compat library. This sets
+       VrLibJavaVM, calls GetEnv/AttachCurrentThread, and caches class
+       references (VrActivity, VrLib, etc.). We must NOT set VrLibJavaVM
+       before calling pvr_OnLoad, because pvr_OnLoad checks if it's already
+       set and returns false immediately, skipping class caching. */
+    if (g_jvm) {
+        /* Preload lib6DofReset.so from the system path so the compat
+           library's pvr_OnLoad can find it. The compat library's dlopen
+           with just the filename fails due to Android namespace rules. */
+        void* dof = dlopen("/system/lib64/lib6DofReset.so", RTLD_NOW | RTLD_GLOBAL);
+        if (!dof) dof = dlopen("lib6DofReset.so", RTLD_NOW | RTLD_GLOBAL);
+        if (dof) {
+            LOGI("preloaded lib6DofReset.so");
+        } else {
+            LOGW("failed to preload lib6DofReset.so: %s", dlerror());
+        }
+
+        typedef int (*pvr_OnLoad_t)(JavaVM*);
+        pvr_OnLoad_t on_load = (pvr_OnLoad_t)dlsym(pvr.handle, "pvr_OnLoad");
+        if (on_load) {
+            int ret = on_load(g_jvm);
+            LOGI("pvr_OnLoad returned %d", ret);
+        } else {
+            LOGW("pvr_OnLoad not found, setting VrLibJavaVM manually");
+            JavaVM** vm_ptr = (JavaVM**)dlsym(pvr.handle, "VrLibJavaVM");
+            if (vm_ptr) *vm_ptr = g_jvm;
+        }
+
+        /* Disable VR casting (MiraCast) - it crashes because it needs Java
+           classes we don't have, and we don't need casting on Neo 2. */
+        char* gEnableVRCasting = (char*)dlsym(pvr.handle, "gEnableVRCasting");
+        if (gEnableVRCasting) {
+            *gEnableVRCasting = 0;
+            LOGI("disabled gEnableVRCasting");
+        }
+        int* iMiracastMode = (int*)dlsym(pvr.handle, "iMiracastMode");
+        if (iMiracastMode) {
+            *iMiracastMode = 0;
+            LOGI("disabled iMiracastMode");
+        }
+    }
 
     #define LOAD(name, field) \
         pvr.field = (typeof(pvr.field))dlsym(pvr.handle, name); \
@@ -405,10 +456,12 @@ JNIEXPORT int Pxr_Shutdown() {
 }
 
 JNIEXPORT int Pxr_IsInitialized() {
+    LOGI("Pxr_IsInitialized -> %d", g_initialized);
     return g_initialized;
 }
 
 JNIEXPORT int Pxr_IsRunning() {
+    LOGI("Pxr_IsRunning -> %d", g_xr_running);
     return g_xr_running;
 }
 
@@ -472,6 +525,31 @@ JNIEXPORT void Pxr_ResetSensorHard() {
     if (pvr.ResetSensor) pvr.ResetSensor(0);
 }
 
+/* ---- Backtrace helper ---- */
+struct BacktraceState {
+    void** current;
+    void** end;
+};
+
+static _Unwind_Reason_Code unwind_cb(struct _Unwind_Context* ctx, void* arg) {
+    struct BacktraceState* state = (struct BacktraceState*)arg;
+    if (state->current == state->end) return _URC_END_OF_STACK;
+    *state->current = (void*)_Unwind_GetIP(ctx);
+    state->current++;
+    return _URC_NO_REASON;
+}
+
+static void print_backtrace(const char* label) {
+    void* buffer[20];
+    struct BacktraceState state = { buffer, buffer + 20 };
+    _Unwind_Backtrace(unwind_cb, &state);
+    int n = state.current - buffer;
+    LOGI("%s backtrace (%d frames):", label, n);
+    for (int i = 0; i < n; i++) {
+        LOGI("  #%d: %p", i, buffer[i]);
+    }
+}
+
 /* ---- Layer / Swapchain ---- */
 
 JNIEXPORT int Pxr_CreateLayer(void* layerParamPtr) {
@@ -485,6 +563,9 @@ JNIEXPORT int Pxr_CreateLayer(void* layerParamPtr) {
         LOGI("Pxr_CreateLayer raw64: %llu %llu %llu %llu %llu %llu",
              raw64[0], raw64[1], raw64[2], raw64[3], raw64[4], raw64[5]);
     }
+
+    /* Print backtrace to see who's calling */
+    print_backtrace("Pxr_CreateLayer");
 
     struct PxrLayerParam* p = (struct PxrLayerParam*)layerParamPtr;
     int width = p ? (int)p->width : 1440;
@@ -510,23 +591,63 @@ JNIEXPORT int Pxr_CreateLayer(void* layerParamPtr) {
     g_layers[slot].format = p ? (int)p->format : GL_RGBA8;
     g_layers[slot].current_index = 0;
 
-    /* Create swapchain textures */
+    int arraySize = p ? (int)p->arraySize : 1;
+    int is_multiview = (arraySize >= 2);
+
+    /* Create swapchain textures. For multiview layers (arraySize>=2),
+       use GL_TEXTURE_2D_ARRAY with 2 layers for stereo rendering. */
     glGenTextures(SWAPCHAIN_LEN, g_layers[slot].textures);
     for (int i = 0; i < SWAPCHAIN_LEN; i++) {
-        glBindTexture(GL_TEXTURE_2D, g_layers[slot].textures[i]);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0,
-                     GL_RGBA, GL_UNSIGNED_BYTE, NULL);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        if (is_multiview) {
+            glBindTexture(GL_TEXTURE_2D_ARRAY, g_layers[slot].textures[i]);
+            glTexImage3D(GL_TEXTURE_2D_ARRAY, 0, GL_RGBA8, width, height, arraySize, 0,
+                         GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+            glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+            glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        } else {
+            glBindTexture(GL_TEXTURE_2D, g_layers[slot].textures[i]);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0,
+                         GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        }
     }
-    glBindTexture(GL_TEXTURE_2D, 0);
+    glBindTexture(is_multiview ? GL_TEXTURE_2D_ARRAY : GL_TEXTURE_2D, 0);
 
     LOGI("Pxr_CreateLayer -> slot %d, textures [%u, %u]",
          slot, g_layers[slot].textures[0], g_layers[slot].textures[1]);
 
     if (p) p->layerId = slot;
+
+    /* Auto-start XR if not already running - the game creates a layer
+       when it's ready to render, so this is the right time to start XR */
+    if (!g_xr_running) {
+        LOGI("auto-starting XR (Pxr_BeginXr)");
+        g_xr_running = 1;
+    }
+
+    /* Set up the layer textures for PVR TimeWarp and init render thread.
+       We're on the render thread so EGL context is available. */
+    if (!g_render_thread_inited && pvr.RenderEvent) {
+        LOGI("initializing PVR render thread from Pxr_CreateLayer");
+        pvr.RenderEvent(RENDER_EVENT_INIT_RENDER_THREAD);
+        g_render_thread_inited = 1;
+    }
+
+    if (pvr.SetupLayerData && pvr.RenderEvent) {
+        float colorScaleOffset[8] = {1, 1, 1, 1, 0, 0, 0, 0};
+        GLuint tex = g_layers[slot].textures[0];
+        LOGI("setting up PVR layer data with tex %u", tex);
+        pvr.SetupLayerData(0, 3, tex, 0, 0, colorScaleOffset);
+        pvr.SetupLayerData(0, 1, tex, 0, 0, colorScaleOffset);
+        pvr.RenderEvent(RENDER_EVENT_BOTH_EYE_END_FRAME);
+        LOGI("submitted first frame to PVR TimeWarp");
+    }
+
     return slot;
 }
 
@@ -540,6 +661,7 @@ JNIEXPORT int Pxr_DestroyLayer(int layerId) {
 }
 
 JNIEXPORT int Pxr_GetLayerImageCount(int layerId, int eye, unsigned int* count) {
+    LOGI("Pxr_GetLayerImageCount(%d, %d)", layerId, eye);
     if (count) *count = SWAPCHAIN_LEN;
     return 0;
 }
@@ -550,6 +672,7 @@ JNIEXPORT int Pxr_GetLayerNextImageIndex(int layerId, int* imageIndex) {
     int idx = g_layers[layerId].current_index;
     g_layers[layerId].current_index = (idx + 1) % SWAPCHAIN_LEN;
     if (imageIndex) *imageIndex = idx;
+    LOGI("Pxr_GetLayerNextImageIndex(%d) -> %d", layerId, idx);
     return 0;
 }
 
@@ -559,6 +682,7 @@ JNIEXPORT int Pxr_GetLayerImage(int layerId, int eye, int imageIndex, unsigned l
     if (imageIndex < 0 || imageIndex >= SWAPCHAIN_LEN)
         return -1;
     if (image) *image = (unsigned long long)g_layers[layerId].textures[imageIndex];
+    LOGI("Pxr_GetLayerImage(%d, %d, %d) -> %llu", layerId, eye, imageIndex, image ? *image : 0);
     return 0;
 }
 
@@ -577,10 +701,12 @@ JNIEXPORT void Pxr_DestroyLayerByRender(int layerId) {
 /* ---- Frame ---- */
 
 JNIEXPORT int Pxr_WaitFrame() {
+    LOGI("Pxr_WaitFrame");
     return 0;
 }
 
 JNIEXPORT int Pxr_BeginFrame() {
+    LOGI("Pxr_BeginFrame");
     return 0;
 }
 
@@ -611,6 +737,7 @@ JNIEXPORT int Pxr_SubmitLayer(void* layerPtr) {
         return -1;
 
     int texId = (int)g_layers[h->layerId].textures[h->imageIndex % SWAPCHAIN_LEN];
+    LOGI("Pxr_SubmitLayer layer=%d imageIdx=%d tex=%u", h->layerId, h->imageIndex, texId);
 
     /* Submit to PVR TimeWarp: layer 0, both eyes, texture, type=0, flags=0 */
     if (pvr.SetupLayerData) {
@@ -622,6 +749,7 @@ JNIEXPORT int Pxr_SubmitLayer(void* layerPtr) {
 }
 
 JNIEXPORT int Pxr_SubmitLayer2(void* layerPtr) {
+    LOGI("Pxr_SubmitLayer2");
     return Pxr_SubmitLayer(layerPtr);
 }
 
@@ -643,6 +771,7 @@ JNIEXPORT int Pxr_SubmitLayerCube2(void* layer) { return 0; }
 
 JNIEXPORT int Pxr_GetPredictedMainSensorState2(double predictTimeMs,
         struct PxrSensorState2* sensorState, int* sensorFrameIndex) {
+    LOGI("Pxr_GetPredictedMainSensorState2(%f)", predictTimeMs);
     if (!sensorState) return -1;
     memset(sensorState, 0, sizeof(*sensorState));
 
@@ -689,6 +818,7 @@ JNIEXPORT int Pxr_GetPredictedMainSensorState2(double predictTimeMs,
 
 JNIEXPORT int Pxr_GetPredictedMainSensorState(double predictTimeMs,
         struct PxrSensorState* sensorState) {
+    LOGI("Pxr_GetPredictedMainSensorState(%f)", predictTimeMs);
     if (!sensorState) return -1;
     memset(sensorState, 0, sizeof(*sensorState));
 
@@ -770,25 +900,39 @@ JNIEXPORT int Pxr_GetFrustum(int eye, float* fl, float* fr, float* fu,
 
 JNIEXPORT int Pxr_GetConfigInt(int configIndex, int* value) {
     if (!value) return -1;
+    int ret;
     switch (configIndex) {
     case PXR_CFG_RENDER_TEX_W:
-        if (pvr.GetIntConfig)
-            return pvr.GetIntConfig(PVR_CFG_EYE_BUFFER_W, value);
+        if (pvr.GetIntConfig) {
+            ret = pvr.GetIntConfig(PVR_ICFG_EYE_TEX_RES0, value);
+            LOGI("Pxr_GetConfigInt(%d) [RENDER_TEX_W] -> %d (val=%d)", configIndex, ret, *value);
+            if (ret != 0 || *value <= 0) { *value = 1440; ret = 0; }
+            return ret;
+        }
         *value = 1440;
+        LOGI("Pxr_GetConfigInt(%d) [RENDER_TEX_W] -> fallback 1440", configIndex);
         return 0;
     case PXR_CFG_RENDER_TEX_H:
-        if (pvr.GetIntConfig)
-            return pvr.GetIntConfig(PVR_CFG_EYE_BUFFER_H, value);
+        if (pvr.GetIntConfig) {
+            ret = pvr.GetIntConfig(PVR_ICFG_EYE_TEX_RES1, value);
+            LOGI("Pxr_GetConfigInt(%d) [RENDER_TEX_H] -> %d (val=%d)", configIndex, ret, *value);
+            if (ret != 0 || *value <= 0) { *value = 1584; ret = 0; }
+            return ret;
+        }
         *value = 1584;
+        LOGI("Pxr_GetConfigInt(%d) [RENDER_TEX_H] -> fallback 1584", configIndex);
         return 0;
     case PXR_CFG_TARGET_FRAME_RATE:
         *value = 72;
+        LOGI("Pxr_GetConfigInt(%d) [TARGET_FRAME_RATE] -> 72", configIndex);
         return 0;
     case PXR_CFG_SYSTEM_DISPLAY_RATE:
         *value = 72;
+        LOGI("Pxr_GetConfigInt(%d) [SYSTEM_DISPLAY_RATE] -> 72", configIndex);
         return 0;
     default:
         *value = 0;
+        LOGI("Pxr_GetConfigInt(%d) -> default 0", configIndex);
         return 0;
     }
 }
@@ -857,8 +1001,8 @@ JNIEXPORT int Pxr_SetExtraLatencyMode(int mode) { return 0; }
 
 /* ---- Focus / App state ---- */
 
-JNIEXPORT int Pxr_GetAppHasFocus() { return 1; }
-JNIEXPORT int Pxr_GetTrackingState() { return 1; }
+JNIEXPORT int Pxr_GetAppHasFocus() { LOGI("Pxr_GetAppHasFocus -> 1"); return 1; }
+JNIEXPORT int Pxr_GetTrackingState() { LOGI("Pxr_GetTrackingState -> 1"); return 1; }
 JNIEXPORT int Pxr_PollEvent(void* event) { return 0; }
 
 /* ---- Multiview ---- */
