@@ -52,36 +52,42 @@ int apk_extract_file(const char *apk_path, const char *entry_name,
     return 0;
 }
 
-int apk_check_compatible(const char *apk_path, char *tmp_so_path, size_t tmp_so_len) {
-    /* check 1: must have arm64-v8a libPvr_UnitySDK.so */
-    const char *so_entry = "lib/arm64-v8a/libPvr_UnitySDK.so";
-    if (apk_has_entry(apk_path, so_entry) < 0) {
-        fprintf(stderr, "incompatible: no lib/arm64-v8a/libPvr_UnitySDK.so found\n");
-        return -1;
-    }
-    printf("[check] found libPvr_UnitySDK.so (arm64-v8a)\n");
+int apk_check_compatible(const char *apk_path, char *tmp_so_path,
+                         size_t tmp_so_len, enum apk_type *type) {
+    *type = APK_TYPE_UNKNOWN;
 
-    /* check 2: must have libil2cpp.so (IL2CPP backend) */
-    if (apk_has_entry(apk_path, "lib/arm64-v8a/libil2cpp.so") < 0) {
-        fprintf(stderr, "warning: no libil2cpp.so found, game may not be IL2CPP\n");
-    } else {
-        printf("[check] found libil2cpp.so\n");
-    }
+    /* Try PVR SDK first: libPvr_UnitySDK.so */
+    const char *pvr_so = "lib/arm64-v8a/libPvr_UnitySDK.so";
+    if (apk_has_entry(apk_path, pvr_so) == 0) {
+        printf("[check] found libPvr_UnitySDK.so (PVR SDK game)\n");
+        *type = APK_TYPE_PVR_SDK;
 
-    /* extract the .so to a temp file for symbol extraction */
-    snprintf(tmp_so_path, tmp_so_len, "/tmp/pvr_shim_orig_XXXXXX.so");
-    int fd = mkstemps(tmp_so_path, 3);
-    if (fd < 0) {
-        perror("mkstemps");
-        return -1;
-    }
-    close(fd);
+        snprintf(tmp_so_path, tmp_so_len, "/tmp/pvr_shim_orig_XXXXXX.so");
+        int fd = mkstemps(tmp_so_path, 3);
+        if (fd < 0) { perror("mkstemps"); return -1; }
+        close(fd);
 
-    if (apk_extract_file(apk_path, so_entry, tmp_so_path) < 0) {
-        unlink(tmp_so_path);
-        return -1;
+        if (apk_extract_file(apk_path, pvr_so, tmp_so_path) < 0) {
+            unlink(tmp_so_path);
+            return -1;
+        }
+        printf("[check] extracted %s\n", pvr_so);
+        return 0;
     }
 
-    printf("[check] extracted libPvr_UnitySDK.so to %s\n", tmp_so_path);
-    return 0;
+    /* Try PXR Platform: libPxrPlatform.so + libpxr_api.so */
+    const char *pxr_api_so = "lib/arm64-v8a/libpxr_api.so";
+    const char *pxr_platform_so = "lib/arm64-v8a/libPxrPlatform.so";
+    if (apk_has_entry(apk_path, pxr_api_so) == 0 &&
+        apk_has_entry(apk_path, pxr_platform_so) == 0) {
+        printf("[check] found libPxrPlatform.so + libpxr_api.so (PXR Platform game)\n");
+        *type = APK_TYPE_PXR_PLATFORM;
+
+        /* For PXR Platform, we don't need to extract symbols from libpxr_api.so
+           since our shim implements all functions directly. */
+        return 0;
+    }
+
+    fprintf(stderr, "incompatible: no PVR SDK or PXR Platform libraries found\n");
+    return -1;
 }

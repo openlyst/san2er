@@ -16,7 +16,6 @@ static const char *HOOK_NAMES[] = {
     "Pvr_SetInitActivity",
     "Pvr_SetCurrentHMDType",
     "Pvr_GetSupportHMDTypes",
-    /* JNI_OnLoad is implemented in loader.cpp to forward to the original */
     "JNI_OnLoad",
     NULL,
 };
@@ -82,7 +81,8 @@ static int ensure_keystore(const char *ks_path) {
 }
 
 static int build_shim(const char *shim_src_dir, const char *ndk_path,
-                      const char *build_dir, char *out_shim_path) {
+                      const char *build_dir, const char *target,
+                      char *out_shim_path) {
     char cmake_toolchain[1024];
     snprintf(cmake_toolchain, sizeof(cmake_toolchain),
              "-DCMAKE_TOOLCHAIN_FILE=%s/build/cmake/android.toolchain.cmake", ndk_path);
@@ -99,12 +99,12 @@ static int build_shim(const char *shim_src_dir, const char *ndk_path,
     if (run_cmd(cmake_cfg) < 0) return -1;
 
     const char *cmake_build[] = {
-        "cmake", "--build", build_dir, "--parallel", NULL,
+        "cmake", "--build", build_dir, "--parallel", "--target", target, NULL,
     };
     if (run_cmd(cmake_build) < 0) return -1;
 
     char so_path[1024];
-    snprintf(so_path, sizeof(so_path), "%s/libPvr_UnitySDK.so", build_dir);
+    snprintf(so_path, sizeof(so_path), "%s/lib%s.so", build_dir, target);
     struct stat st;
     if (stat(so_path, &st) < 0) {
         fprintf(stderr, "shim .so not found at %s\n", so_path);
@@ -116,8 +116,6 @@ static int build_shim(const char *shim_src_dir, const char *ndk_path,
 }
 
 static int patch_manifest(const char *manifest_path) {
-    /* apktool decodes AndroidManifest.xml to a text XML file.
-       We do simple string-based patches since the format is predictable. */
     FILE *f = fopen(manifest_path, "r");
     if (!f) {
         perror("fopen manifest");
@@ -136,7 +134,6 @@ static int patch_manifest(const char *manifest_path) {
 
     int changed = 0;
 
-    /* add headtracking feature if missing */
     if (!strstr(buf, "android.hardware.vr.headtracking")) {
         char *insert = strstr(buf, "<application");
         if (insert) {
@@ -152,7 +149,6 @@ static int patch_manifest(const char *manifest_path) {
         }
     }
 
-    /* fix instructionset 32 -> 64 */
     char *is = strstr(buf, "com.pvr.instructionset");
     if (is) {
         char *val = strstr(is, "android:value=\"32\"");
@@ -175,8 +171,8 @@ static int patch_manifest(const char *manifest_path) {
     return 0;
 }
 
-static int inject_shim(const char *decoded_dir, const char *shim_path) {
-    char orig_path[1024], renamed_path[1024], cmd_buf[2048];
+static int inject_shim_pvr(const char *decoded_dir, const char *shim_path) {
+    char orig_path[1024], renamed_path[1024];
 
     snprintf(orig_path, sizeof(orig_path), "%s/lib/arm64-v8a/libPvr_UnitySDK.so", decoded_dir);
     snprintf(renamed_path, sizeof(renamed_path), "%s/lib/arm64-v8a/libPvr_UnitySDK_orig.so", decoded_dir);
@@ -199,11 +195,31 @@ static int inject_shim(const char *decoded_dir, const char *shim_path) {
     return 0;
 }
 
+static int inject_shim_pxr(const char *decoded_dir, const char *shim_path) {
+    char target_path[1024];
+
+    snprintf(target_path, sizeof(target_path), "%s/lib/arm64-v8a/libpxr_api.so", decoded_dir);
+
+    struct stat st;
+    if (stat(target_path, &st) < 0) {
+        fprintf(stderr, "libpxr_api.so not found in decoded apk\n");
+        return -1;
+    }
+
+    /* Replace libpxr_api.so with our shim (no need to keep original) */
+    const char *cp_cmd[] = { "cp", shim_path, target_path, NULL };
+    if (run_cmd(cp_cmd) < 0) return -1;
+
+    printf("[patch] replaced libpxr_api.so with PXR->PVR translation shim\n");
+    return 0;
+}
+
 static void usage(const char *prog) {
     fprintf(stderr,
         "usage: %s <input.apk> [output.apk]\n"
         "\n"
         "  patches a Pico Neo 3 game APK to run on Pico Neo 2.\n"
+        "  supports both old PVR SDK games and OpenXR-based PXR Platform games.\n"
         "  checks compatibility, builds the shim, swaps the .so,\n"
         "  fixes the manifest, and signs the output.\n"
         "\n"
@@ -232,7 +248,6 @@ int main(int argc, char **argv) {
         keystore = home_ks;
     }
 
-    /* parse args */
     int i = 1;
     while (i < argc) {
         if (!strcmp(argv[i], "--ndk") && i + 1 < argc) {
@@ -260,7 +275,6 @@ int main(int argc, char **argv) {
     }
 
     if (!out_path) {
-        /* auto-generate output name: foo.apk -> foo_neo2.apk */
         char auto_out[1024];
         snprintf(auto_out, sizeof(auto_out), "%s", apk_path);
         char *dot = strrchr(auto_out, '.');
@@ -269,8 +283,6 @@ int main(int argc, char **argv) {
         out_path = strdup(auto_out);
     }
 
-    /* auto-detect shim source dir: binary is at <shim_root>/src/patcher/build/pvr-patcher
-       we need to go up 4 directory levels to reach <shim_root> */
     if (!shim_src) {
         char self[1024];
         ssize_t n = readlink("/proc/self/exe", self, sizeof(self) - 1);
@@ -301,48 +313,66 @@ int main(int argc, char **argv) {
     printf("  keystore:  %s\n", keystore);
     printf("\n");
 
-    /* step 1: compatibility check + extract .so */
+    /* step 1: compatibility check */
     printf("--- step 1: compatibility check ---\n");
     char tmp_so[512];
-    if (apk_check_compatible(apk_path, tmp_so, sizeof(tmp_so)) < 0) {
+    enum apk_type apk_type;
+    if (apk_check_compatible(apk_path, tmp_so, sizeof(tmp_so), &apk_type) < 0) {
         fprintf(stderr, "APK is not compatible with the shim\n");
         return 1;
     }
 
-    /* step 2: extract symbols from the original .so */
-    printf("\n--- step 2: extract exported symbols ---\n");
-    elf_symbol_list_t symbols;
-    if (elf_extract_pvr_symbols(tmp_so, &symbols) < 0) {
-        fprintf(stderr, "failed to extract symbols\n");
+    const char *shim_target = NULL;
+    const char *shim_libname = NULL;
+
+    if (apk_type == APK_TYPE_PVR_SDK) {
+        shim_target = "Pvr_UnitySDK";
+        shim_libname = "libPvr_UnitySDK.so";
+        printf("[type] PVR SDK game (old PVR runtime)\n");
+    } else {
+        shim_target = "pxr_api";
+        shim_libname = "libpxr_api.so";
+        printf("[type] PXR Platform game (OpenXR-based)\n");
+    }
+
+    /* step 2: for PVR SDK, extract symbols; for PXR Platform, skip */
+    elf_symbol_list_t symbols = {0};
+
+    if (apk_type == APK_TYPE_PVR_SDK) {
+        printf("\n--- step 2: extract exported symbols ---\n");
+        if (elf_extract_pvr_symbols(tmp_so, &symbols) < 0) {
+            fprintf(stderr, "failed to extract symbols\n");
+            unlink(tmp_so);
+            return 1;
+        }
+        printf("[symbols] found %d exported functions\n", symbols.count);
         unlink(tmp_so);
-        return 1;
-    }
-    printf("[symbols] found %d exported Pvr_/PVR_/Java_/JNI_ functions\n", symbols.count);
-    unlink(tmp_so);
 
-    if (symbols.count == 0) {
-        fprintf(stderr, "no compatible symbols found, this APK is not a PicoVR game\n");
-        return 1;
-    }
+        if (symbols.count == 0) {
+            fprintf(stderr, "no compatible symbols found\n");
+            return 1;
+        }
 
-    /* step 3: generate stub files */
-    printf("\n--- step 3: generate forward stubs ---\n");
-    char stubs_path[1024], vars_path[1024];
-    snprintf(stubs_path, sizeof(stubs_path), "%s/src/generated/forward_stubs.S", shim_src);
-    snprintf(vars_path, sizeof(vars_path), "%s/src/generated/forward_vars.cpp", shim_src);
+        printf("\n--- step 3: generate forward stubs ---\n");
+        char stubs_path[1024], vars_path[1024];
+        snprintf(stubs_path, sizeof(stubs_path), "%s/src/generated/forward_stubs.S", shim_src);
+        snprintf(vars_path, sizeof(vars_path), "%s/src/generated/forward_vars.cpp", shim_src);
 
-    if (stub_gen_generate(&symbols, HOOK_NAMES, stubs_path, vars_path) < 0) {
-        fprintf(stderr, "failed to generate stubs\n");
-        return 1;
+        if (stub_gen_generate(&symbols, HOOK_NAMES, stubs_path, vars_path) < 0) {
+            fprintf(stderr, "failed to generate stubs\n");
+            return 1;
+        }
+        printf("[stubs] generated %s and %s\n", stubs_path, vars_path);
+    } else {
+        printf("\n--- step 2/3: skipped (PXR Platform uses static shim) ---\n");
     }
-    printf("[stubs] generated %s and %s\n", stubs_path, vars_path);
 
     /* step 4: build the shim */
     printf("\n--- step 4: build shim ---\n");
     char build_dir[1024];
     snprintf(build_dir, sizeof(build_dir), "%s/build", shim_src);
     char shim_out[1024];
-    if (build_shim(shim_src, ndk_path, build_dir, shim_out) < 0) {
+    if (build_shim(shim_src, ndk_path, build_dir, (char *)shim_target, shim_out) < 0) {
         fprintf(stderr, "failed to build shim\n");
         return 1;
     }
@@ -355,7 +385,7 @@ int main(int argc, char **argv) {
     snprintf(decoded_dir, sizeof(decoded_dir), "%s/decoded_%d", work_dir, (int)getpid());
 
     const char *decode_cmd[] = {
-        "apktool", "decode", "-f", "-s", "-o", decoded_dir, apk_path, NULL,
+        "apktool", "decode", "-f", "-o", decoded_dir, apk_path, NULL,
     };
     if (run_cmd(decode_cmd) < 0) {
         fprintf(stderr, "apktool decode failed\n");
@@ -367,7 +397,12 @@ int main(int argc, char **argv) {
     char manifest_path[1024];
     snprintf(manifest_path, sizeof(manifest_path), "%s/AndroidManifest.xml", decoded_dir);
     patch_manifest(manifest_path);
-    inject_shim(decoded_dir, shim_out);
+
+    if (apk_type == APK_TYPE_PVR_SDK) {
+        inject_shim_pvr(decoded_dir, shim_out);
+    } else {
+        inject_shim_pxr(decoded_dir, shim_out);
+    }
 
     /* step 7: rebuild APK */
     printf("\n--- step 7: rebuild APK ---\n");

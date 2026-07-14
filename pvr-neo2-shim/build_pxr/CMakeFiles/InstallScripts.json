@@ -1,0 +1,7 @@
+{
+	"InstallScripts" : 
+	[
+		"/home/calico/san2er/pvr-neo2-shim/build_pxr/cmake_install.cmake"
+	],
+	"Parallel" : false
+}
