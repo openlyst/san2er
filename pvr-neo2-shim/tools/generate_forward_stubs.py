@@ -15,8 +15,8 @@ def generate(functions, hooks, stubs_path, vars_path):
             f.write(f"    .global {name}\n")
             f.write(f"    .type {name}, %function\n")
             f.write(f"{name}:\n")
-            f.write(f"    adrp x16, {name}_orig\n")
-            f.write(f"    ldr x16, [x16, :lo12:{name}_orig]\n")
+            f.write(f"    adrp x16, :got:{name}_orig\n")
+            f.write(f"    ldr x16, [x16, :got_lo12:{name}_orig]\n")
             f.write(f"    br x16\n\n")
 
     with open(vars_path, "w") as f:

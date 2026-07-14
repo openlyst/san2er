@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.10.2)
-project(pvr_neo2_shim)
+project(pvr_neo2_shim LANGUAGES C CXX ASM)
 
 add_library(Pvr_UnitySDK SHARED
     src/loader.cpp
