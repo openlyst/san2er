@@ -27,9 +27,8 @@ def main():
 
         lib_dir = Path(decoded) / "lib" / "arm64-v8a"
 
-        # 1. Remove new XR plugin libs (they don't work on Neo 2)
-        for f in ["libPxrPlatform.so", "libpxr_api.so", "libpxrplatformloader.so",
-                   "libpxr_api.so", "libGfxWXRUnity.so",
+        # 1. Remove WaveVR libs (not needed on Pico)
+        for f in ["libGfxWXRUnity.so",
                    "libwvr_api.so", "libwvr_client_bootstrap.so",
                    "libwvrassimp.so", "libwvrugl.so", "libwvrunity.so", "libwvrunityxr.so"]:
             p = lib_dir / f
