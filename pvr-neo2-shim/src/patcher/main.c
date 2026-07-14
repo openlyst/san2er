@@ -16,6 +16,8 @@ static const char *HOOK_NAMES[] = {
     "Pvr_SetInitActivity",
     "Pvr_SetCurrentHMDType",
     "Pvr_GetSupportHMDTypes",
+    /* JNI_OnLoad is implemented in loader.cpp to forward to the original */
+    "JNI_OnLoad",
     NULL,
 };
 
