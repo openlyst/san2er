@@ -56,4 +56,11 @@ The patcher only works on APKs you already own. It does not remove store entitle
 
 ## Status
 
-Tested and working on Pico Neo 2 with Warplanes: Battles Over Pacific. The shim forwards all 451 exported symbols (Pvr_/PVR_ functions, JNI_OnLoad, and Java_ JNI entry points) from the original `libPvr_UnitySDK.so`. TimeWarp runs at 72 FPS with active eye buffer consumption.
+Tested and working on Pico Neo 2 with Warplanes: Battles Over Pacific. The shim
+forwards all 455 exported symbols (Pvr_/PVR_ functions, JNI_OnLoad, and Java_
+JNI entry points) from the original `libPvr_UnitySDK.so`. TimeWarp runs at 72
+FPS with active eye buffer consumption.
+
+The shim contains no game-specific code. The patcher auto-detects exported
+symbols from each game's `libPvr_UnitySDK.so` and generates trampolines
+dynamically, so any PVR SDK-based Neo 3 game should work without modification.
