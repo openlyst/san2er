@@ -9,7 +9,7 @@ import zipfile
 
 
 def from_exported_symbols(so_path):
-    """Extract C-style Pvr_/PVR_ functions from a .so's dynamic symbol table."""
+    """Extract exported functions from a .so's dynamic symbol table."""
     out = subprocess.check_output(
         ["readelf", "-sW", so_path], text=True, stderr=subprocess.DEVNULL
     )
@@ -17,7 +17,7 @@ def from_exported_symbols(so_path):
     for line in out.splitlines():
         if "FUNC" not in line or "GLOBAL" not in line or "DEFAULT" not in line:
             continue
-        m = re.search(r"\s((?:Pvr_|PVR_)[A-Za-z][A-Za-z0-9_]+)$", line)
+        m = re.search(r"\s((?:Pvr_|PVR_|Java_|JNI_)[A-Za-z][A-Za-z0-9_]+)$", line)
         if m:
             funcs.add(m.group(1))
     return funcs
