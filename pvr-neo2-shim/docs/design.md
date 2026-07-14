@@ -53,3 +53,7 @@ These are not part of the native shim but are required for the Neo 2 runtime to 
 ## Security / legal note
 
 The patcher only works on APKs you already own. It does not remove store entitlement checks, DRM, or licensing. It is a compatibility layer for running your own games on your own hardware.
+
+## Status
+
+Tested and working on Pico Neo 2 with Warplanes: Battles Over Pacific. The shim forwards all 451 exported symbols (Pvr_/PVR_ functions, JNI_OnLoad, and Java_ JNI entry points) from the original `libPvr_UnitySDK.so`. TimeWarp runs at 72 FPS with active eye buffer consumption.

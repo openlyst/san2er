@@ -56,11 +56,14 @@ The script will decode the APK, swap the library, fix the manifest, rebuild, and
 
 ## Status
 
-This is the first cut of the shim. It is not yet tested on a live Neo 2 because the headset is currently in use. The architecture is in place; the exact Neo 2 display parameters and the precise set of calls to intercept will be finalized once we can run logcat and iterate on device.
+Working on Pico Neo 2. The shim has been tested with Warplanes: Battles Over Pacific
+(`pvr.sdk.version=XR Platform_1.2.4.7`) and renders at 72 FPS with TimeWarp active.
+Audio, controllers, and head tracking all function.
 
 ## Next steps
 
-- Capture `adb logcat` from the patched APK running on Neo 2.
-- Identify which intercepted call still fails or returns Neo 3 parameters.
-- Fill in the Neo 2 screen/lens parameters in `src/hooks.cpp`.
-- Later: extend the same approach to OpenXR-based games using the new Pico Integration SDK.
+- Test with additional Neo 3 titles to verify broad compatibility.
+- Fill in Neo 2-specific screen/lens parameters in `src/hooks.cpp` if any game
+  queries them and gets wrong values.
+- Later: extend the same approach to OpenXR-based games using the new Pico
+  Integration SDK 2.0.5.
