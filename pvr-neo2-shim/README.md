@@ -6,27 +6,35 @@ Audio and controllers already work on Neo 2 because they go through legacy servi
 
 ## How it works
 
-1. `tools/extract_pvr_functions.py` reads the game's IL2CPP binary (`libil2cpp.so`) and the PicoVR SDK C# scripts to discover exactly which `Pvr_*` functions the game imports from `libPvr_UnitySDK.so`.
-2. `tools/generate_forward_stubs.py` builds an arm64 assembly stub file plus a C++ resolver table. Every discovered function gets a tiny trampoline that jumps to the corresponding original function pointer.
-3. `src/hooks.cpp` overrides the subset of those functions that affect display initialization (`Pvr_Init`, `Pvr_ChangeScreenParameters`, `Pvr_SetInitActivity`, `Pvr_SetCurrentHMDType`, etc.). The hook calls the original, then applies or fixes Neo 2 parameters.
-4. `src/loader.cpp` loads the renamed original `libPvr_UnitySDK_orig.so` and resolves all function pointers at load time.
-5. `tools/patch_apk.py` repackages a target APK: it renames the original `libPvr_UnitySDK.so` to `libPvr_UnitySDK_orig.so`, injects the shim as `libPvr_UnitySDK.so`, fixes manifest metadata, and re-signs.
+1. The C patcher (`src/patcher/`) reads the input APK, checks for `lib/arm64-v8a/libPvr_UnitySDK.so`, and extracts it.
+2. It parses the ELF export table to find all `Pvr_`/`PVR_`/`Java_`/`JNI_` functions.
+3. It generates arm64 assembly trampolines and a C++ resolver table for every exported function.
+4. It builds the shim `.so` with the Android NDK.
+5. `src/hooks.cpp` overrides the subset of functions that affect display initialization (`Pvr_Init`, `Pvr_ChangeScreenParameters`, `Pvr_SetInitActivity`, `Pvr_SetCurrentHMDType`, etc.).
+6. `src/loader.cpp` loads the renamed original `libPvr_UnitySDK_orig.so` and resolves all function pointers at load time.
+7. The patcher decodes the APK with apktool, swaps the library, fixes the manifest, rebuilds, and re-signs.
 
 ## Project layout
 
 ```
 pvr-neo2-shim/
-  CMakeLists.txt
-  build.sh
+  CMakeLists.txt          # shim .so build (cross-compiled for arm64)
+  build.sh                # builds both the patcher and (optionally) the shim
   README.md
   src/
     loader.cpp / loader.h
     hooks.cpp / hooks.h
     log.h
-    generated/          # populated by generate_forward_stubs.py
+    generated/            # populated by the patcher or generate_forward_stubs.py
       forward_stubs.S
       forward_vars.cpp
-  tools/
+    patcher/              # host-side C patcher tool
+      main.c
+      apk_check.c / .h    # ZIP reading, compatibility check
+      elf_symbols.c / .h  # ELF export table parsing
+      stub_gen.c / .h     # assembly + C++ stub generation
+      CMakeLists.txt
+  tools/                  # legacy Python tools (still work, patcher replaces them)
     extract_pvr_functions.py
     generate_forward_stubs.py
     patch_apk.py
@@ -41,18 +49,30 @@ cd pvr-neo2-shim
 ./build.sh
 ```
 
-`build.sh` uses the Android NDK installed at `/opt/android-sdk/ndk`. It defaults to `arm64-v8a` and API 27, which matches the provided game APKs.
+This builds the C patcher. To also pre-build the shim for a specific APK, pass it as an argument: `./build.sh game.apk`.
 
 ## Patch a game
 
 ```bash
-./tools/patch_apk.py \
-  --apk /path/to/Warplanes_Battle_over_Pacific_1.1.2.1.apk \
-  --shim build/arm64-v8a/libPvr_UnitySDK.so \
-  --out /path/to/Warplanes_Battle_over_Pacific_neo2.apk
+src/patcher/build/pvr-patcher <input.apk> [output.apk]
 ```
 
-The script will decode the APK, swap the library, fix the manifest, rebuild, and re-sign with a debug keystore.
+The patcher will:
+1. Check that the APK has `lib/arm64-v8a/libPvr_UnitySDK.so` (compatibility check)
+2. Extract exported symbols from the original `.so`
+3. Generate and build the shim
+4. Decode the APK, swap the library, fix the manifest
+5. Rebuild, zipalign, and sign the output
+
+If no output path is given, it appends `_neo2.apk` to the input name.
+
+Options:
+```
+  --ndk <path>      Android NDK path (default: /opt/android-sdk/ndk/27.0.12077973)
+  --shim-src <dir>  Shim source dir (default: auto-detect)
+  --work <dir>      Temp work dir (default: ~/.pvr-neo2-shim/work)
+  --keystore <ks>   Debug keystore (default: ~/.pvr-neo2-shim/debug.keystore)
+```
 
 ## Status
 

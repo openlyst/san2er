@@ -5,6 +5,7 @@ sdks/
 # pvr-neo2-shim build artifacts
 pvr-neo2-shim/build/
 pvr-neo2-shim/.work/
+pvr-neo2-shim/src/patcher/build/
 pvr-neo2-shim/src/generated/functions.json
 pvr-neo2-shim/src/generated/forward_stubs.S
 pvr-neo2-shim/src/generated/forward_vars.cpp
