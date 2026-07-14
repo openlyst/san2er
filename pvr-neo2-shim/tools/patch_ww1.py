@@ -18,7 +18,8 @@ def main():
     apk = sys.argv[1]
     old_apk = sys.argv[2]
     shim = sys.argv[3]
-    out = sys.argv[4] if len(sys.argv) > 4 else apk.replace(".apk", "_neo2.apk")
+    pxr_stub = sys.argv[4]
+    out = sys.argv[5] if len(sys.argv) > 5 else apk.replace(".apk", "_neo2.apk")
 
     work = tempfile.mkdtemp(prefix="ww1-patch-")
     try:
@@ -60,7 +61,10 @@ def main():
         # Shim -> libPvr_UnitySDK.so
         shutil.copy2(shim, lib_dir / "libPvr_UnitySDK.so")
 
-        print("added libUnityPicoVR.so, libtracking_module.so, libPvr_UnitySDK.so (shim), libPvr_UnitySDK_orig.so")
+        # 4b. Replace libpxr_api.so with stub (so PXR C# loader doesn't fail)
+        shutil.copy2(pxr_stub, lib_dir / "libpxr_api.so")
+
+        print("added libUnityPicoVR.so, libtracking_module.so, libPvr_UnitySDK.so (shim), libPvr_UnitySDK_orig.so, libpxr_api.so (stub)")
 
         # 5. Update UnitySubsystemsManifest.json
         manifest_path = Path(decoded) / "assets" / "bin" / "Data" / "UnitySubsystems" / "PxrPlatform" / "UnitySubsystemsManifest.json"
