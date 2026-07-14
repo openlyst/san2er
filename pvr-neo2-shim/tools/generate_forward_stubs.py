@@ -6,6 +6,9 @@ import os
 
 def generate(functions, hooks, stubs_path, vars_path):
     hooks_set = set(hooks)
+    # JNI_OnLoad is implemented in loader.cpp to forward to the original
+    # library, so skip it here to avoid a duplicate symbol.
+    hooks_set.add("JNI_OnLoad")
     funcs = [f for f in functions if f not in hooks_set]
 
     with open(stubs_path, "w") as f:
