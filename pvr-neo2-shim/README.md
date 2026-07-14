@@ -76,14 +76,18 @@ Options:
 
 ## Status
 
-Working on Pico Neo 2. The shim has been tested with Warplanes: Battles Over Pacific
-(`pvr.sdk.version=XR Platform_1.2.4.7`) and renders at 72 FPS with TimeWarp active.
-Audio, controllers, and head tracking all function.
+Working on Pico Neo 2. The generic shim has been tested with Warplanes: Battles
+Over Pacific (`pvr.sdk.version=XR Platform_1.2.4.7`) and renders at 72 FPS with
+TimeWarp active. Audio, controllers, and head tracking all function.
+
+The shim is generic — no game-specific code or patches. Any PVR SDK-based Neo 3
+game that ships `libPvr_UnitySDK.so` should work without modification.
 
 ## Next steps
 
-- Test with additional Neo 3 titles to verify broad compatibility.
+- Test with additional PVR-based Neo 3 titles to verify broad compatibility.
 - Fill in Neo 2-specific screen/lens parameters in `src/hooks.cpp` if any game
   queries them and gets wrong values.
-- Later: extend the same approach to OpenXR-based games using the new Pico
-  Integration SDK 2.0.5.
+- OpenXR-based games (Pico Integration SDK 2.x, `libPxrPlatform.so`) are not
+  supported by this shim. They need a different approach since Neo 2 lacks the
+  OpenXR runtime those games expect.
