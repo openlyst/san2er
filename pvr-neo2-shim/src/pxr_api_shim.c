@@ -36,7 +36,7 @@ typedef int  (*Pvr_GetFOV_t)(float*, float*);
 typedef int  (*Pvr_GetMainSensorState_t)(float*, float*, float*, float*,
                                          float*, float*, float*,
                                          float*, float*, int*);
-typedef void (*Pvr_SetupLayerData_t)(int, int, int, int, int, float*);
+typedef void (*Pvr_SetupLayerData_t)(int, int, int, int, int, float*); /* layerIndex, sideMask, textureId, textureType, layerFlags, colorScaleAndOffset */
 typedef void (*UnityRenderEvent_t)(int);
 typedef int  (*Pvr_GetPsensorState_t)(void);
 typedef int  (*Pvr_GetSensorState_t)(int, float*, float*, float*, float*,
@@ -69,7 +69,9 @@ static struct {
 
 static JavaVM* g_jvm = NULL;
 static int g_initialized = 0;
+static int g_init_requested = 0;
 static int g_xr_running = 0;
+static int g_render_thread_inited = 0;
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /* Layer/swapchain state */
@@ -94,15 +96,20 @@ static float g_fov_up = 50.0f;
 static float g_fov_down = 50.0f;
 static int g_fov_cached = 0;
 
-/* Render event IDs matching PVR SDK enum */
+/* Render event IDs matching PVR SDK RenderEventType enum */
 #define RENDER_EVENT_INIT_RENDER_THREAD  1024
 #define RENDER_EVENT_PAUSE               1025
 #define RENDER_EVENT_RESUME              1026
 #define RENDER_EVENT_LEFT_EYE_END_FRAME  1027
 #define RENDER_EVENT_RIGHT_EYE_END_FRAME 1028
 #define RENDER_EVENT_TIMEWARP            1029
-#define RENDER_EVENT_SHUTDOWN            1030
-#define RENDER_EVENT_BOTH_EYE_END_FRAME  1033
+#define RENDER_EVENT_RESET_VRMODE_PARMS  1030
+#define RENDER_EVENT_SHUTDOWN            1031
+#define RENDER_EVENT_BEGIN_EYE           1032
+#define RENDER_EVENT_END_EYE             1033
+#define RENDER_EVENT_BOUNDARY_LEFT       1034
+#define RENDER_EVENT_BOUNDARY_RIGHT      1035
+#define RENDER_EVENT_BOTH_EYE_END_FRAME  1036
 
 /* ---- PVR config enum values (from Pvr_UnitySDKAPI.cs) ---- */
 enum pvr_config {
@@ -135,12 +142,16 @@ enum pxr_config {
 static int load_pvr_runtime() {
     if (pvr.handle) return 0;
 
-    pvr.handle = dlopen("libPvr_UnitySDK.so", RTLD_NOW | RTLD_LOCAL);
+    /* The APK bundles a PVR SDK compat library (libPvr_UnitySDK_compat.so)
+       that provides Pvr_SetupLayerData, UnityRenderEvent, etc. This is a
+       known-good PVR SDK library from a Neo 2 game. We use a distinct name
+       to avoid conflict with the system libPvr_UnitySDK.so. */
+    pvr.handle = dlopen("libPvr_UnitySDK_compat.so", RTLD_NOW | RTLD_LOCAL);
     if (!pvr.handle) {
-        LOGE("failed to load libPvr_UnitySDK.so: %s", dlerror());
+        LOGE("failed to load libPvr_UnitySDK_compat.so: %s", dlerror());
         return -1;
     }
-    LOGI("loaded system libPvr_UnitySDK.so");
+    LOGI("loaded libPvr_UnitySDK_compat.so (PVR SDK compat)");
 
     #define LOAD(name, field) \
         pvr.field = (typeof(pvr.field))dlsym(pvr.handle, name); \
@@ -225,22 +236,31 @@ static void init_pvr_runtime(JNIEnv* env) {
         LOGI("Pvr_StartSensor(0) -> %d", ret);
     }
 
-    /* Cache FOV */
-    if (pvr.GetFOV) {
+    /* Cache FOV from Pvr_GetMainSensorState which returns vfov and hfov */
+    if (pvr.GetMainSensorState) {
+        float x, y, z, w, px, py, pz, vfov, hfov;
+        int viewNum;
+        if (pvr.GetMainSensorState(&x, &y, &z, &w, &px, &py, &pz,
+                                    &vfov, &hfov, &viewNum) == 0) {
+            g_fov_up = g_fov_down = vfov * 0.5f;
+            g_fov_left = g_fov_right = hfov * 0.5f;
+            g_fov_cached = 1;
+            LOGI("FOV: v=%f h=%f (L=%f R=%f U=%f D=%f)", vfov, hfov,
+                 g_fov_left, g_fov_right, g_fov_up, g_fov_down);
+        }
+    } else if (pvr.GetFOV) {
         float vfov, hfov;
         pvr.GetFOV(&vfov, &hfov);
         g_fov_up = g_fov_down = vfov * 0.5f;
         g_fov_left = g_fov_right = hfov * 0.5f;
         g_fov_cached = 1;
-        LOGI("FOV: v=%f h=%f (L=%f R=%f U=%f D=%f)", vfov, hfov,
+        LOGI("FOV (GetFOV): v=%f h=%f (L=%f R=%f U=%f D=%f)", vfov, hfov,
              g_fov_left, g_fov_right, g_fov_up, g_fov_down);
     }
 
-    /* Init render thread */
-    if (pvr.RenderEvent) {
-        pvr.RenderEvent(RENDER_EVENT_INIT_RENDER_THREAD);
-        LOGI("render thread initialized");
-    }
+    /* Don't init render thread here - UnityRenderEvent(INIT_RENDER_THREAD)
+       needs an EGL context and must be called from the render thread.
+       We'll call it on the first Pxr_EndFrame instead. */
 
     g_initialized = 1;
     pthread_mutex_unlock(&g_lock);
@@ -251,6 +271,15 @@ static void init_pvr_runtime(JNIEnv* env) {
 JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* reserved) {
     g_jvm = vm;
     LOGI("JNI_OnLoad pxr_api_shim");
+
+    /* If Pxr_Initialize was called before JNI_OnLoad (it is, since
+       libPxrPlatform.so loads us as a dependency), do the init now. */
+    if (g_init_requested && !g_initialized) {
+        JNIEnv* env = NULL;
+        if ((*vm)->GetEnv(vm, (void**)&env, JNI_VERSION_1_6) == JNI_OK) {
+            init_pvr_runtime(env);
+        }
+    }
     return JNI_VERSION_1_6;
 }
 
@@ -261,11 +290,31 @@ JNIEXPORT void JNICALL JNI_OnUnload(JavaVM* vm, void* reserved) {
 /* ---- Helper: get JNIEnv ---- */
 
 static JNIEnv* get_env() {
-    if (!g_jvm) return NULL;
+    JavaVM* vm = g_jvm;
+    if (!vm) {
+        /* libpxr_api.so may be loaded as a dependency before JNI_OnLoad.
+           Use JNI_GetCreatedJavaVMs to find the VM. */
+        void* h = dlopen("libart.so", RTLD_NOW);
+        if (h) {
+            typedef jint (*GetVMs_t)(JavaVM**, jsize, jsize*);
+            GetVMs_t fn = (GetVMs_t)dlsym(h, "JNI_GetCreatedJavaVMs");
+            if (fn) {
+                jsize count = 0;
+                fn(NULL, 0, &count);
+                if (count > 0) {
+                    fn(&vm, 1, NULL);
+                }
+            }
+            dlclose(h);
+        }
+    }
+    if (!vm) return NULL;
+    g_jvm = vm;
+
     JNIEnv* env = NULL;
-    if ((*g_jvm)->GetEnv(g_jvm, (void**)&env, JNI_VERSION_1_6) == JNI_OK)
+    if ((*vm)->GetEnv(vm, (void**)&env, JNI_VERSION_1_6) == JNI_OK)
         return env;
-    (*g_jvm)->AttachCurrentThread(g_jvm, &env, NULL);
+    (*vm)->AttachCurrentThread(vm, &env, NULL);
     return env;
 }
 
@@ -332,11 +381,16 @@ struct PxrLayerHeader {
 
 JNIEXPORT int Pxr_Initialize() {
     LOGI("Pxr_Initialize");
+    g_init_requested = 1;
+
     JNIEnv* env = get_env();
     if (env) {
         init_pvr_runtime(env);
     } else {
-        LOGE("no JNIEnv for Pxr_Initialize");
+        /* JNI_OnLoad hasn't been called yet. The init will be deferred
+           to JNI_OnLoad. This is expected when libPxrPlatform.so loads
+           us as a dependency before the Java runtime registers us. */
+        LOGW("Pxr_Initialize: no JNIEnv yet, deferring to JNI_OnLoad");
     }
     return 0;
 }
@@ -360,14 +414,14 @@ JNIEXPORT int Pxr_IsRunning() {
 
 JNIEXPORT int Pxr_BeginXr() {
     LOGI("Pxr_BeginXr");
-    if (pvr.RenderEvent) pvr.RenderEvent(RENDER_EVENT_RESUME);
     g_xr_running = 1;
     return 0;
 }
 
 JNIEXPORT int Pxr_EndXr() {
     LOGI("Pxr_EndXr");
-    if (pvr.RenderEvent) pvr.RenderEvent(RENDER_EVENT_PAUSE);
+    if (pvr.RenderEvent && g_render_thread_inited)
+        pvr.RenderEvent(RENDER_EVENT_PAUSE);
     g_xr_running = 0;
     return 0;
 }
@@ -421,6 +475,17 @@ JNIEXPORT void Pxr_ResetSensorHard() {
 /* ---- Layer / Swapchain ---- */
 
 JNIEXPORT int Pxr_CreateLayer(void* layerParamPtr) {
+    /* Dump raw bytes to figure out the struct layout */
+    unsigned int* raw = (unsigned int*)layerParamPtr;
+    if (raw) {
+        LOGI("Pxr_CreateLayer raw: %u %u %u %u %u %u %u %u %u %u %u %u",
+             raw[0], raw[1], raw[2], raw[3], raw[4], raw[5],
+             raw[6], raw[7], raw[8], raw[9], raw[10], raw[11]);
+        unsigned long long* raw64 = (unsigned long long*)layerParamPtr;
+        LOGI("Pxr_CreateLayer raw64: %llu %llu %llu %llu %llu %llu",
+             raw64[0], raw64[1], raw64[2], raw64[3], raw64[4], raw64[5]);
+    }
+
     struct PxrLayerParam* p = (struct PxrLayerParam*)layerParamPtr;
     int width = p ? (int)p->width : 1440;
     int height = p ? (int)p->height : 1584;
@@ -520,6 +585,13 @@ JNIEXPORT int Pxr_BeginFrame() {
 }
 
 JNIEXPORT int Pxr_EndFrame() {
+    /* Init render thread on first EndFrame (needs EGL context) */
+    if (!g_render_thread_inited && pvr.RenderEvent) {
+        LOGI("initializing PVR render thread");
+        pvr.RenderEvent(RENDER_EVENT_INIT_RENDER_THREAD);
+        g_render_thread_inited = 1;
+    }
+
     /* Trigger TimeWarp via PVR render event */
     if (pvr.RenderEvent) {
         pvr.RenderEvent(RENDER_EVENT_BOTH_EYE_END_FRAME);
@@ -656,12 +728,23 @@ JNIEXPORT int Pxr_GetPredictedDisplayTime(double* t) {
 
 JNIEXPORT int Pxr_GetFov(int eye, float* fovLeft, float* fovRight,
                          float* fovUp, float* fovDown) {
-    if (!g_fov_cached && pvr.GetFOV) {
-        float vfov, hfov;
-        pvr.GetFOV(&vfov, &hfov);
-        g_fov_up = g_fov_down = vfov * 0.5f;
-        g_fov_left = g_fov_right = hfov * 0.5f;
-        g_fov_cached = 1;
+    if (!g_fov_cached) {
+        if (pvr.GetMainSensorState) {
+            float x, y, z, w, px, py, pz, vfov, hfov;
+            int viewNum;
+            if (pvr.GetMainSensorState(&x, &y, &z, &w, &px, &py, &pz,
+                                        &vfov, &hfov, &viewNum) == 0) {
+                g_fov_up = g_fov_down = vfov * 0.5f;
+                g_fov_left = g_fov_right = hfov * 0.5f;
+                g_fov_cached = 1;
+            }
+        } else if (pvr.GetFOV) {
+            float vfov, hfov;
+            pvr.GetFOV(&vfov, &hfov);
+            g_fov_up = g_fov_down = vfov * 0.5f;
+            g_fov_left = g_fov_right = hfov * 0.5f;
+            g_fov_cached = 1;
+        }
     }
     if (fovLeft) *fovLeft = g_fov_left;
     if (fovRight) *fovRight = g_fov_right;
@@ -810,15 +893,17 @@ JNIEXPORT int Pxr_UnregisterPsensor() {
     return 0;
 }
 JNIEXPORT int Pxr_getPsensorState() {
-    if (pvr.GetPsensorState) return pvr.GetPsensorState();
+    /* Don't call Pvr_GetPsensorState - it crashes on Neo 2 due to
+       uninitialized OcFusion. Just return "not near" (0). */
     return 0;
 }
 
 /* ---- Controller stubs ---- */
 
-JNIEXPORT int Pxr_GetControllerConnectStatus(unsigned int id, int* status) {
-    if (status) *status = 1;
-    return 0;
+JNIEXPORT int Pxr_GetControllerConnectStatus(unsigned int id, void* status) {
+    /* libPxrPlatform.so may pass this as a value or pointer depending on version.
+       Just return connected=1 without touching the second arg to avoid crashes. */
+    return 1;
 }
 
 JNIEXPORT int Pxr_GetControllerTrackingState(unsigned int id, double t,

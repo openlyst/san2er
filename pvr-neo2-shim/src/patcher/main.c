@@ -195,7 +195,8 @@ static int inject_shim_pvr(const char *decoded_dir, const char *shim_path) {
     return 0;
 }
 
-static int inject_shim_pxr(const char *decoded_dir, const char *shim_path) {
+static int inject_shim_pxr(const char *decoded_dir, const char *shim_path,
+                            const char *shim_src) {
     char target_path[1024];
 
     snprintf(target_path, sizeof(target_path), "%s/lib/arm64-v8a/libpxr_api.so", decoded_dir);
@@ -211,6 +212,23 @@ static int inject_shim_pxr(const char *decoded_dir, const char *shim_path) {
     if (run_cmd(cp_cmd) < 0) return -1;
 
     printf("[patch] replaced libpxr_api.so with PXR->PVR translation shim\n");
+
+    /* Copy the PVR SDK compat library into the APK.
+       This provides Pvr_SetupLayerData, UnityRenderEvent, etc.
+       that the system libPvr_UnitySDK.so doesn't export.
+       Named differently to avoid conflict with system lib. */
+    char compat_src[1024], compat_dst[1024];
+    snprintf(compat_src, sizeof(compat_src), "%s/prebuilt/libPvr_UnitySDK_compat.so", shim_src);
+    snprintf(compat_dst, sizeof(compat_dst), "%s/lib/arm64-v8a/libPvr_UnitySDK_compat.so", decoded_dir);
+
+    if (stat(compat_src, &st) < 0) {
+        fprintf(stderr, "warning: compat library not found at %s\n", compat_src);
+    } else {
+        const char *cp_compat[] = { "cp", compat_src, compat_dst, NULL };
+        if (run_cmd(cp_compat) < 0) return -1;
+        printf("[patch] added libPvr_UnitySDK.so (PVR SDK compat library)\n");
+    }
+
     return 0;
 }
 
@@ -401,7 +419,7 @@ int main(int argc, char **argv) {
     if (apk_type == APK_TYPE_PVR_SDK) {
         inject_shim_pvr(decoded_dir, shim_out);
     } else {
-        inject_shim_pxr(decoded_dir, shim_out);
+        inject_shim_pxr(decoded_dir, shim_out, shim_src);
     }
 
     /* step 7: rebuild APK */
