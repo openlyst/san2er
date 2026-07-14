@@ -37,36 +37,50 @@ PXR Unable to retrieve XR Display Interface.
 
 Controllers and audio still work because input is registered through `PicoXR Input` / `PicoXR HMD` / `Pico Neo` / `Pico G` layouts and the legacy `HummingBirdControllerService`, and Android audio is independent of the VR compositor.
 
-### 2. The actual Neo 3 game APK is built with an older SDK
+### 2. The actual Neo 3 game uses the newer XR Platform SDK
 
-`games/neo3/Super_Hot_1.90_FNAL.apk` decodes to a manifest with:
+`games/neo3/Warplanes_Battle_over_Pacific_1.1.2.1.apk` decodes to a manifest with:
 
 ```xml
-<meta-data android:name="pvr.sdk.version" android:value="Unity_2.8.9.12"/>
-<activity android:name="com.unity3d.player.UnityPlayerNativeActivityPico" ... />
-<meta-data android:name="com.pvr.instructionset" android:value="32"/>
+<meta-data android:name="pvr.sdk.version" android:value="XR Platform_1.2.4.7"/>
+<activity android:name="com.unity3d.player.UnityPlayerActivity" ... />
+<uses-feature android:name="android.hardware.vr.headtracking" android:required="true" android:version="1"/>
 ```
 
-This is the legacy PicoVR Unity SDK, **not** the new Pico Integration SDK 2.0.5. Its native library `libPvr_UnitySDK.so` contains the build path `PicoSDK_Unity-dev_phoenix` and a hardcoded supported-device string:
+This is the PicoXR Platform SDK (the 1.2.x line), not the legacy PicoVR Unity SDK and not the newer Pico Integration SDK 2.0.5. Its native library `libPvr_UnitySDK.so` was built from the `PicoXR_Platform_Unity_SDK` branch (visible in the embedded build paths), and the APK ships WaveVR native libraries alongside it:
+
+```
+lib/arm64-v8a/libwvr_api.so
+lib/arm64-v8a/libwvrunity.so
+lib/arm64-v8a/libwvrunityxr.so
+lib/arm64-v8a/libwvrugl.so
+lib/arm64-v8a/libwvr_client_bootstrap.so
+lib/arm64-v8a/libUnityPicoVR.so
+lib/arm64-v8a/libGfxWXRUnity.so
+```
+
+The `libPvr_UnitySDK.so` still carries the same hardcoded supported-device string as the legacy SDK:
 
 ```
 Pico1,Pico1S,Pico2
 ```
 
-It does **not** list a Neo 3 device name, and it uses `ScreenParameters::findScreenByModel(...)` to pick lens/display parameters from the VR service. If the Neo 2 model string is not matched, display parameters may not be set, leaving the compositor with no valid output.
+and uses `ScreenParameters::findScreenByModel(...)` to pick lens/display parameters from the VR service. On Neo 2 the XR Platform runtime path is not available, so the display subsystem never comes up. The manifest does not declare `com.pvr.instructionset`, and the activity is the standard `UnityPlayerActivity` rather than `UnityPlayerNativeActivityPico`.
 
-Additionally, the manifest declares `com.pvr.instructionset` = `32` while the APK only contains `arm64-v8a` native libraries. That mismatch can cause the VR runtime to fail to load the display plugin even though the package installs.
+### 3. The native Neo 2 game uses the legacy PicoVR SDK
 
-### 3. The working Neo 2 game uses a different manifest / activity
-
-`games/neo2/Warplanes_Battle_over_Pacific_1.1.2.1.apk` uses:
+`games/neo2/Super_Hot_1.90_FNAL.apk` is a native Neo 2 title (Chinese market release). Its manifest:
 
 ```xml
-<activity android:name="com.unity3d.player.UnityPlayerActivity" ... />
-<uses-feature android:name="android.hardware.vr.headtracking" android:required="true" android:version="1"/>
+<meta-data android:name="pvr.sdk.version" android:value="Unity_2.8.9.12"/>
+<activity android:name="com.unity3d.player.UnityPlayerNativeActivityPico" ... />
+<meta-data android:name="com.pvr.instructionset" android:value="32"/>
+<meta-data android:name="com.pvr.hmd.trackingmode" android:value="6dof"/>
 ```
 
-It does **not** set `com.pvr.instructionset`, and it includes WaveVR native libraries (`libwvr*.so`). This aligns with the Neo 2 runtime and is why it renders correctly.
+This is the legacy PicoVR Unity SDK (the deprecated pre-XR-Platform line). Its `libPvr_UnitySDK.so` was built from the `PicoSDK_Unity-dev_phoenix` branch. The APK includes the Pico Chinese-market login/pay SDK (`com.pico.loginpaysdk`), confirming it was a domestic Neo 2 release. It renders correctly on Neo 2 because it targets the legacy runtime that Neo 2 still provides.
+
+The manifest declares `com.pvr.instructionset` = `32` while the APK only contains `arm64-v8a` native libraries. This does not cause a problem on Neo 2 because the legacy runtime tolerates it, but it is worth noting for comparison with the Neo 3 game.
 
 ## Why Audio and Controllers Work
 
@@ -87,13 +101,15 @@ Use the standard `UnityPlayerActivity`, include WaveVR libraries if required, an
 
 ### If you only have the APK
 
-Patching is hit-or-miss, but the most likely blockers are:
+Manifest changes alone are not enough. Empirical testing on a black-screen + audio Neo 3 game showed that manifest patching did not fix the display. A working approach requires:
 
-1. Remove or change `<meta-data android:name="com.pvr.instructionset" android:value="32"/>` to `64` so it matches the shipped arm64 libraries.
-2. Add `<uses-feature android:name="android.hardware.vr.headtracking" android:required="true" android:version="1"/>` if the Neo 2 runtime requires it.
-3. Repack, re-sign, and test on device.
+1. Swap `.so` files — replace the Neo 3 `libPvr_UnitySDK.so` (and related PicoXR Platform libs) with Neo 2-compatible equivalents, or intercept calls via a shim.
+2. Patch the Vulkan/rendering path if the game targets a graphics API version the Neo 2 runtime does not expose.
+3. Patch `libil2cpp.so` to fix any hardcoded XR Platform calls that bypass the native library indirection.
+4. Fix manifest metadata as a secondary step (instructionset, headtracking feature, etc.).
+5. Repack, re-sign, and test on device.
 
-If the native activity `UnityPlayerNativeActivityPico` is hard-coded to assume a Neo 3-era runtime, manifest changes alone may not be enough.
+The `pvr-neo2-shim` in this repo implements step 1 by replacing `libPvr_UnitySDK.so` with a forwarding shim that intercepts display-critical calls and applies Neo 2 parameters, while passing everything else through to the renamed original.
 
 ## Files Referenced
 
@@ -102,5 +118,5 @@ If the native activity `UnityPlayerNativeActivityPico` is hard-coded to assume a
 - `sdks/neo3 sdk/Pico Unity Integration SDK-2.0.5/Runtime/Android/PxrPlatform.aar`
 - `sdks/neo3 sdk/Pico Unity Integration SDK-2.0.5/Runtime/Android/pxr_api-release.aar`
 - `sdks/neo2/PicoNeo2-SDKs-EXEs/Unity+Plugin/PicoVR_Unity_SDK_2.8.12_B583.zip`
-- `games/neo3/Super_Hot_1.90_FNAL.apk`
-- `games/neo2/Warplanes_Battle_over_Pacific_1.1.2.1.apk`
+- `games/neo3/Warplanes_Battle_over_Pacific_1.1.2.1.apk`
+- `games/neo2/Super_Hot_1.90_FNAL.apk`

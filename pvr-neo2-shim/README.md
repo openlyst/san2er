@@ -1,8 +1,8 @@
 # pvr-neo2-shim
 
-Compatibility shim that lets early PicoVR-based "Pico Neo 3" games render on a Pico Neo 2.
+Compatibility shim that lets PicoXR Platform-based Pico Neo 3 games render on a Pico Neo 2.
 
-Audio and controllers already work on Neo 2 because they go through legacy services that are still present. The display does not work because the VR compositor / display-initialization path expects either the newer PicoXR OpenXR runtime (for new-SDK games) or the legacy `UnityPlayerNativeActivityPico` path configured for a device the Neo 2 runtime does not recognize (for old-SDK games). This shim sits in the middle: it keeps the original `libPvr_UnitySDK.so` for sensor/controller/audio logic and intercepts the display-related calls to apply Neo 2-compatible parameters.
+Audio and controllers already work on Neo 2 because they go through legacy services that are still present. The display does not work because the XR Platform runtime path expects a PicoXR OpenXR runtime that Neo 2 does not provide. This shim sits in the middle: it keeps the original `libPvr_UnitySDK.so` for sensor/controller/audio logic and intercepts the display-related calls to apply Neo 2-compatible parameters.
 
 ## How it works
 
@@ -47,9 +47,9 @@ cd pvr-neo2-shim
 
 ```bash
 ./tools/patch_apk.py \
-  --apk /path/to/Super_Hot_1.90_FNAL.apk \
+  --apk /path/to/Warplanes_Battle_over_Pacific_1.1.2.1.apk \
   --shim build/arm64-v8a/libPvr_UnitySDK.so \
-  --out /path/to/Super_Hot_1.90_FNAL_neo2.apk
+  --out /path/to/Warplanes_Battle_over_Pacific_neo2.apk
 ```
 
 The script will decode the APK, swap the library, fix the manifest, rebuild, and re-sign with a debug keystore.

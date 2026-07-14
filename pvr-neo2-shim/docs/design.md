@@ -2,17 +2,17 @@
 
 ## Problem statement
 
-Early Pico Neo 3 games built with the legacy PicoVR Unity SDK install on a Pico Neo 2 and have working audio and controllers, but the display stays black. The controllers/audio work because they route through legacy services (`HummingBirdControllerService`, Android audio). The display fails because the VR compositor initialization path is not compatible with the Neo 2 runtime.
+Pico Neo 3 games built with the PicoXR Platform SDK (the 1.2.x line) install on a Pico Neo 2 and have working audio and controllers, but the display stays black. The controllers/audio work because they route through legacy services (`HummingBirdControllerService`, Android audio). The display fails because the XR Platform runtime path expects a PicoXR OpenXR runtime that Neo 2 does not provide.
 
 ## Target scope
 
 This shim is designed for games that:
 
-- Import from `libPvr_UnitySDK.so` (legacy PicoVR SDK, not the new `PxrPlatform` / `pxr_api` libraries).
-- Use `com.unity3d.player.UnityPlayerNativeActivityPico`.
+- Import from `libPvr_UnitySDK.so` built from the `PicoXR_Platform_Unity_SDK` branch (the 1.2.x XR Platform SDK, not the newer `PxrPlatform` / `pxr_api` Integration SDK 2.0.5, and not the legacy `PicoSDK_Unity-dev_phoenix` line).
+- Use `com.unity3d.player.UnityPlayerActivity` and ship WaveVR native libraries (`libwvr*.so`, `libUnityPicoVR.so`, `libGfxWXRUnity.so`).
 - Are compiled with IL2CPP (so the set of imported `Pvr_*` functions is discoverable in `libil2cpp.so`).
 
-New OpenXR-based games are out of scope for this first iteration and will be handled separately.
+The reference target is Warplanes: Battle Over Pacific (`pvr.sdk.version=XR Platform_1.2.4.7`). Newer OpenXR-based games using Pico Integration SDK 2.0.5 are out of scope for this first iteration and will be handled separately.
 
 ## Intercept strategy
 
