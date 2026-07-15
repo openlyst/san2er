@@ -1479,28 +1479,6 @@ JNIEXPORT int Pxr_PollEvent(void* event) {
                 if (pvr.SetCurrentRenderTexture) {
                     pvr.SetCurrentRenderTexture(tex);
                 }
-                /* Render a test pattern to verify the display pipeline.
-                   This fills the eye texture with a red gradient so we can
-                   see if TimeWarp is actually displaying our texture. */
-                {
-                    static int test_rendered = 0;
-                    if (!test_rendered) {
-                        GLuint fbo = 0;
-                        glGenFramebuffers(1, &fbo);
-                        glBindFramebuffer(GL_FRAMEBUFFER, fbo);
-                        glFramebufferTextureLayer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, tex, 0, 0);
-                        glViewport(0, 0, g_layers[i].width, g_layers[i].height);
-                        glClearColor(1.0f, 0.0f, 0.0f, 1.0f);
-                        glClear(GL_COLOR_BUFFER_BIT);
-                        glFramebufferTextureLayer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, tex, 0, 1);
-                        glClearColor(0.0f, 1.0f, 0.0f, 1.0f);
-                        glClear(GL_COLOR_BUFFER_BIT);
-                        glBindFramebuffer(GL_FRAMEBUFFER, 0);
-                        glDeleteFramebuffers(1, &fbo);
-                        test_rendered = 1;
-                        FLOG("Pxr_PollEvent: test pattern rendered");
-                    }
-                }
                 if (g_layers[i].is_multiview) {
                     if (pvr.EnableSinglePass) pvr.EnableSinglePass(1);
                     int* sp_tex = (int*)dlsym(pvr.handle, "g_iSinglePassTexID");
@@ -1565,6 +1543,27 @@ JNIEXPORT int Pxr_PollEvent(void* event) {
                         }
                     }
                     pvr.RenderEvent(RENDER_EVENT_TIMEWARP);
+                }
+                /* Bind the eye texture as the current framebuffer so Unity
+                   renders to it directly. The game's XR display subsystem
+                   never starts, so Unity would otherwise render to the
+                   screen. By binding the eye texture FBO here (after frame
+                   submission, before returning to Unity), Unity's cameras
+                   will render to the eye texture for this frame. */
+                {
+                    static GLuint eye_fbo = 0;
+                    if (!eye_fbo) glGenFramebuffers(1, &eye_fbo);
+                    glBindFramebuffer(GL_FRAMEBUFFER, eye_fbo);
+                    if (g_layers[i].is_multiview) {
+                        if (g_glFramebufferTextureMultiview) {
+                            g_glFramebufferTextureMultiview(GL_FRAMEBUFFER,
+                                GL_COLOR_ATTACHMENT0, tex, 0, 0, 2);
+                        }
+                    } else {
+                        glFramebufferTextureLayer(GL_FRAMEBUFFER,
+                            GL_COLOR_ATTACHMENT0, tex, 0, 0);
+                    }
+                    glViewport(0, 0, g_layers[i].width, g_layers[i].height);
                 }
                 if (poll_count == 0) FLOG("Pxr_PollEvent: first frame submitted");
                 poll_count++;
