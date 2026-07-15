@@ -1318,7 +1318,7 @@ JNIEXPORT int Pxr_CreateLayer(void* layerParamPtr) {
                 *(unsigned char*)(s + 0x68) = 1;
                 *(int*)(s + 0xf960) = tex;
                 *(int*)(s + 0xf964) = 0;
-                *(int*)(s + 0xf928) = tex;
+                *(int*)(s + 0xf928) = 0;
                 *(int*)(s + 0xf92c) = 0;
                 *(int*)(s + 0xf918) = tex;
                 *(int*)(s + 0xf91c) = 0;
@@ -1327,9 +1327,8 @@ JNIEXPORT int Pxr_CreateLayer(void* layerParamPtr) {
                 *(unsigned char*)(s + 0xd810) = 1;
                 *(int*)(s + 0xdabc) = 0;
                 *(int*)(s + 0xda98) = 0;
-                LOGI("Pxr_CreateLayer: set up+0xf960=%d up+0xf928=%d up+0x68=%d",
-                     *(int*)(s + 0xf960), *(int*)(s + 0xf928),
-                     *(unsigned char*)(s + 0x68));
+                LOGI("Pxr_CreateLayer: set up+0xf960=%d up+0x68=%d",
+                     *(int*)(s + 0xf960), *(unsigned char*)(s + 0x68));
                 FLOG("Pxr_CreateLayer: set struct flags+tex");
             }
         }
@@ -1810,13 +1809,77 @@ JNIEXPORT int Pxr_SetExtraLatencyMode(int mode) { return 0; }
 JNIEXPORT int Pxr_GetAppHasFocus() { LOGI("Pxr_GetAppHasFocus -> 1"); FLOG("Pxr_GetAppHasFocus"); return 1; }
 JNIEXPORT int Pxr_GetTrackingState() { LOGI("Pxr_GetTrackingState -> 1"); FLOG("Pxr_GetTrackingState"); return 1; }
 JNIEXPORT int Pxr_PollEvent(void* event) {
-    /* Submit frames to PVR TimeWarp from here - this is called every
-       frame from the same thread that called Pxr_CreateLayer, ensuring
-       GL context compatibility. The game's render loop never starts
-       (display subsystem Start() is never called), so we feed TimeWarp
-       directly. */
     static int poll_count = 0;
     if (g_render_thread_inited && pvr.RenderEvent) {
+        /* Blit Unity's rendered output to the eye texture at the START
+           of Pxr_PollEvent. Unity renders between Pxr_PollEvent calls,
+           so the previous frame's output is now in Unity's FBO.
+           We copy it to the eye texture before submitting to TimeWarp. */
+        if (poll_count > 0) {
+            int any_in_use = 0;
+            for (int i = 0; i < MAX_LAYERS; i++) any_in_use += g_layers[i].in_use;
+            LOGI("Pxr_PollEvent: blit phase poll_count=%d layers_in_use=%d", poll_count, any_in_use);
+            for (int i = 0; i < MAX_LAYERS; i++) {
+                if (g_layers[i].in_use) {
+                    LOGI("Pxr_PollEvent: blit START i=%d", i);
+                    GLuint tex = g_layers[i].textures[0];
+                    int w = g_layers[i].width;
+                    int h = g_layers[i].height;
+                    GLint prevFbo = 0, prevReadFbo = 0, prevDrawFbo = 0;
+                    glGetIntegerv(GL_FRAMEBUFFER_BINDING, &prevFbo);
+                    glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &prevReadFbo);
+                    glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &prevDrawFbo);
+
+                    GLuint tmpFbo = 0;
+                    glGenFramebuffers(1, &tmpFbo);
+                    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, tmpFbo);
+                    /* tex is a GL_TEXTURE_2D_ARRAY (multiview). Use
+                       glFramebufferTextureLayer to attach layer 0. */
+                    glFramebufferTextureLayer(GL_DRAW_FRAMEBUFFER,
+                        GL_COLOR_ATTACHMENT0, tex, 0, 0);
+
+                    /* Read from Unity's current FBO */
+                    glBindFramebuffer(GL_READ_FRAMEBUFFER, prevFbo);
+
+                    static int blit_log = 0;
+                    if (blit_log < 200) {
+                        unsigned char pix[4] = {0};
+                        /* Check Unity's current FBO */
+                        glBindFramebuffer(GL_READ_FRAMEBUFFER, prevFbo);
+                        glReadPixels(w/2, h/2, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, pix);
+                        LOGI("PollEvent blit: srcFbo=%d tex=%d pix=%d,%d,%d,%d w=%d h=%d",
+                             prevFbo, tex, pix[0], pix[1], pix[2], pix[3], w, h);
+                        /* Check eye texture content directly */
+                        GLuint checkFbo = 0;
+                        glGenFramebuffers(1, &checkFbo);
+                        glBindFramebuffer(GL_READ_FRAMEBUFFER, checkFbo);
+                        glFramebufferTextureLayer(GL_READ_FRAMEBUFFER,
+                            GL_COLOR_ATTACHMENT0, tex, 0, 0);
+                        GLenum st = glCheckFramebufferStatus(GL_READ_FRAMEBUFFER);
+                        if (st == GL_FRAMEBUFFER_COMPLETE) {
+                            glReadPixels(w/2, h/2, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, pix);
+                            LOGI("PollEvent eye tex: tex=%d pix=%d,%d,%d,%d", tex, pix[0], pix[1], pix[2], pix[3]);
+                        }
+                        glDeleteFramebuffers(1, &checkFbo);
+                        glBindFramebuffer(GL_READ_FRAMEBUFFER, prevFbo);
+                        blit_log++;
+                    }
+
+                    GLenum srcSt = glCheckFramebufferStatus(GL_READ_FRAMEBUFFER);
+                    GLenum dstSt = glCheckFramebufferStatus(GL_DRAW_FRAMEBUFFER);
+                    if (srcSt == GL_FRAMEBUFFER_COMPLETE && dstSt == GL_FRAMEBUFFER_COMPLETE) {
+                        glBlitFramebuffer(0, 0, w, h, 0, 0, w, h,
+                                          GL_COLOR_BUFFER_BIT, GL_LINEAR);
+                    }
+
+                    glBindFramebuffer(GL_READ_FRAMEBUFFER, prevReadFbo);
+                    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, prevDrawFbo);
+                    glBindFramebuffer(GL_FRAMEBUFFER, prevFbo);
+                    glDeleteFramebuffers(1, &tmpFbo);
+                    break;
+                }
+            }
+        }
         /* Check GL context */
         void* (*eglGetCurrentContext)(void) = (void*(*)(void))dlsym(RTLD_DEFAULT, "eglGetCurrentContext");
         if (eglGetCurrentContext) {
@@ -1862,9 +1925,16 @@ JNIEXPORT int Pxr_PollEvent(void* event) {
                         *(int*)(s + 0xda98) = 0;
                         static int poll_struct_log = 0;
                         if (poll_struct_log < 3) {
-                            LOGI("Pxr_PollEvent: set up+0xf960=%d up+0x68=%d",
-                                 *(int*)(s + 0xf960), *(unsigned char*)(s + 0x68));
+                            LOGI("Pxr_PollEvent: set up=%p up+0xf960=%d up+0x68=%d up+0x4c=%d",
+                                 s, *(int*)(s + 0xf960), *(unsigned char*)(s + 0x68),
+                                 *(int*)(s + 0x4c));
                             poll_struct_log++;
+                        }
+                    } else {
+                        static int null_log = 0;
+                        if (null_log < 3) {
+                            LOGI("Pxr_PollEvent: dlsym(up) returned NULL!");
+                            null_log++;
                         }
                     }
                 }
@@ -1876,6 +1946,18 @@ JNIEXPORT int Pxr_PollEvent(void* event) {
                 } else if (pvr.CameraEndFrame) {
                     pvr.CameraEndFrame(0, tex);
                     pvr.CameraEndFrame(1, g_layers[i].is_multiview ? tex : g_layers[i].textures[1]);
+                }
+                /* Check if CameraEndFrame wrote up+0x4c */
+                {
+                    char* s = (char*)dlsym(pvr.handle, "up");
+                    if (s) {
+                        static int check_log = 0;
+                        if (check_log < 5) {
+                            LOGI("Pxr_PollEvent: after BEF up+0x4c=%d up+0x50=%d up+0x90=%d",
+                                 *(int*)(s + 0x4c), *(int*)(s + 0x50), *(int*)(s + 0x90));
+                            check_log++;
+                        }
+                    }
                 }
                 /* Read eye texture content and Unity's FBO for debugging */
                 {
@@ -2275,30 +2357,18 @@ static void wrapped_RenderEvent(int event) {
         LOGI("wrapped_RenderEvent: event=%d g_render_thread_inited=%d", event, g_render_thread_inited);
         event_log_count++;
     }
-    /* Set texture IDs in the up struct before calling PVR render events.
-       From Ghidra decompilation of UnityRenderEvent_:
-       - 0x40c (BOTH_EYE): reads up+0xf960 + up+0xf964, calls PVR_CameraEndFrame
-         which writes up+0x4c (left) and up+0x50 (right)
-       - 0x405 (TIMEWARP): reads up+0xf928 + up+0xf92c, calls PVR_TimeWarpEvent
-         which checks up+0x4c!=0, copies to up+0x90, calls pvr_WarpSwap
-       - up+0x68 must be non-zero for CameraEndFrame to write */
+    /* Set texture IDs in the up struct before calling PVR render events. */
     if (g_render_thread_inited) {
         char* s = (char*)dlsym(pvr.handle, "up");
         if (s) {
             for (int i = 0; i < MAX_LAYERS; i++) {
                 if (g_layers[i].in_use) {
                     GLuint tex = g_layers[i].textures[0];
-                    /* up+0x68: enable CameraEndFrame to write up+0x4c/0x50 */
                     *(unsigned char*)(s + 0x68) = 1;
-                    /* up+0xf960: texture ID for BOTH_EYE_END_FRAME
-                       (passed to PVR_CameraEndFrame which writes up+0x4c) */
                     *(int*)(s + 0xf960) = tex;
                     *(int*)(s + 0xf964) = 0;
-                    /* up+0xf928: frame index for TIMEWARP (must be <= 63!)
-                       NOT a texture ID - PVR_TimeWarpEvent_ skips if > 0x3f */
                     *(int*)(s + 0xf928) = 0;
                     *(int*)(s + 0xf92c) = 0;
-                    /* up+0xd810: enable eyebuffer path in TimeWarp */
                     *(unsigned char*)(s + 0xd810) = 1;
                     *(int*)(s + 0xdabc) = 0;
                     break;
