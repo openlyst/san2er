@@ -1,4 +1,0 @@
-/home/calico/san2er/pvr-neo2-shim/build_pxr/CMakeFiles/Pvr_UnitySDK.dir
-/home/calico/san2er/pvr-neo2-shim/build_pxr/CMakeFiles/pxr_api.dir
-/home/calico/san2er/pvr-neo2-shim/build_pxr/CMakeFiles/edit_cache.dir
-/home/calico/san2er/pvr-neo2-shim/build_pxr/CMakeFiles/rebuild_cache.dir

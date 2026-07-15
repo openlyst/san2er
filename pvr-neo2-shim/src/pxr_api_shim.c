@@ -21,6 +21,9 @@
 #include <GLES3/gl3.h>
 #include <GLES2/gl2ext.h>
 #include <unwind.h>
+#include <link.h>
+#include <sys/mman.h>
+#include <elf.h>
 
 #define TAG "pxr_api_shim"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
@@ -66,6 +69,7 @@ typedef void (*Pvr_SetupLayerData_t)(int, int, int, int, int, float*); /* layerI
 typedef void (*Pvr_SetCurrentRenderTexture_t)(int); /* textureId */
 typedef void (*Pvr_EnableSinglePass_t)(int); /* enable */
 typedef void (*Pvr_CameraEndFrame_t)(int, int); /* eye, textureId */
+typedef void (*Pvr_BothEyeEndFrameFU_t)(int, int, int); /* tex, depthTex, boundaryTex */
 typedef void (*Pvr_TimeWarpEvent_t)(int); /* textureId/frameParam */
 typedef void (*UnityRenderEvent_t)(int);
 typedef int  (*Pvr_GetPsensorState_t)(void);
@@ -77,6 +81,7 @@ typedef void (*Pvr_ChangeScreenParameters_t)(const char*, int, int, double, doub
 
 static struct {
     void* handle;
+    void* ext2_handle;
     Pvr_Init_t Init;
     Pvr_StartSensor_t StartSensor;
     Pvr_StopSensor_t StopSensor;
@@ -90,6 +95,7 @@ static struct {
     Pvr_SetCurrentRenderTexture_t SetCurrentRenderTexture;
     Pvr_EnableSinglePass_t EnableSinglePass;
     Pvr_CameraEndFrame_t CameraEndFrame;
+    Pvr_BothEyeEndFrameFU_t BothEyeEndFrameFU;
     Pvr_TimeWarpEvent_t TimeWarpEvent;
     UnityRenderEvent_t RenderEvent;
     Pvr_GetPsensorState_t GetPsensorState;
@@ -129,48 +135,118 @@ static unsigned char* g_swap_pixels = NULL;
 static int g_swap_pix_w = 0, g_swap_pix_h = 0;
 static int g_swap_hook_installed = 0;
 
-static EGLBoolean hook_eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
-    if (g_render_thread_inited && real_eglSwapBuffers) {
-        for (int i = 0; i < MAX_LAYERS; i++) {
-            if (g_layers[i].in_use) {
-                int w = g_layers[i].width;
-                int h = g_layers[i].height;
-                GLuint tex = g_layers[i].textures[0];
-                if (!g_swap_pixels || g_swap_pix_w != w || g_swap_pix_h != h) {
-                    free(g_swap_pixels);
-                    g_swap_pixels = (unsigned char*)malloc(w * h * 4);
-                    g_swap_pix_w = w;
-                    g_swap_pix_h = h;
-                }
-                GLint prevFbo = 0;
-                glGetIntegerv(GL_FRAMEBUFFER_BINDING, &prevFbo);
-                glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
-                glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, g_swap_pixels);
-                glBindFramebuffer(GL_FRAMEBUFFER, prevFbo);
-                glBindTexture(GL_TEXTURE_2D_ARRAY, tex);
-                glTexSubImage3D(GL_TEXTURE_2D_ARRAY, 0, 0, 0, 0, w, h, 1,
-                                GL_RGBA, GL_UNSIGNED_BYTE, g_swap_pixels);
-                glTexSubImage3D(GL_TEXTURE_2D_ARRAY, 0, 0, 0, 1, w, h, 1,
-                                GL_RGBA, GL_UNSIGNED_BYTE, g_swap_pixels);
-                glBindTexture(GL_TEXTURE_2D_ARRAY, 0);
-                break;
+/* FBO redirect state - declared early for hook functions */
+static GLuint g_eye_fbo = 0;
+static int g_fbo_hook_installed = 0;
+static int g_redirect_fbo = 0; /* when 1, redirect FBO 0 to eye_fbo */
+
+/* ---- eglGetProcAddress hook to intercept GL function lookups ---- */
+static void* (*real_eglGetProcAddress)(const char*) = NULL;
+static void (*real_glBindFramebuffer_ptr)(GLenum, GLuint) = NULL;
+
+static void hook_glBindFramebuffer_ptr(GLenum target, GLuint fbo) {
+    static int ptr_bind_log = 0;
+    if (ptr_bind_log < 30) {
+        LOGI("hook_glBindFramebuffer_ptr: target=0x%x fbo=%d redirect=%d eye_fbo=%d",
+             target, fbo, g_redirect_fbo, g_eye_fbo);
+        ptr_bind_log++;
+    }
+    if (g_redirect_fbo && fbo == 0 && g_eye_fbo) {
+        fbo = g_eye_fbo;
+    }
+    if (real_glBindFramebuffer_ptr) {
+        real_glBindFramebuffer_ptr(target, fbo);
+    } else {
+        glBindFramebuffer(target, fbo);
+    }
+}
+
+static void* hook_eglGetProcAddress(const char* procname) {
+    static int call_count = 0;
+    if (call_count < 30) {
+        LOGI("hook_eglGetProcAddress: %s", procname ? procname : "null");
+        call_count++;
+    }
+    void* result = NULL;
+    if (real_eglGetProcAddress) {
+        result = real_eglGetProcAddress(procname);
+    } else {
+        result = (void*)eglGetProcAddress(procname);
+    }
+    if (procname && strcmp(procname, "glBindFramebuffer") == 0 && result) {
+        real_glBindFramebuffer_ptr = (void(*)(GLenum, GLuint))result;
+        LOGI("hook_eglGetProcAddress: intercepted glBindFramebuffer=%p -> %p",
+             result, hook_glBindFramebuffer_ptr);
+        return (void*)hook_glBindFramebuffer_ptr;
+    }
+    return result;
+}
+
+static void wrapped_RenderEvent(int event);
+static UnityRenderEvent_t pvr_real_RenderEvent = NULL;
+
+/* ---- glBindFramebuffer hook via GOT patching ---- */
+static void (*real_glBindFramebuffer)(GLenum, GLuint) = NULL;
+static GLuint g_eye_fbo_2 = 0; /* unused, g_eye_fbo declared above */
+
+static void hook_glBindFramebuffer(GLenum target, GLuint fbo) {
+    static int bind_log_count = 0;
+    if (bind_log_count < 30) {
+        LOGI("hook_glBindFramebuffer: target=0x%x fbo=%d redirect=%d eye_fbo=%d",
+             target, fbo, g_redirect_fbo, g_eye_fbo);
+        bind_log_count++;
+    }
+    if (g_redirect_fbo && fbo == 0 && target == GL_FRAMEBUFFER && g_eye_fbo) {
+        real_glBindFramebuffer(target, g_eye_fbo);
+    } else {
+        real_glBindFramebuffer(target, fbo);
+    }
+}
+
+/* Generic GOT patching state */
+static const char* g_patch_sym_name = NULL;
+static void** g_patch_real_fn = NULL;
+static void* g_patch_hook_fn = NULL;
+static int g_patch_found = 0;
+static void* g_scan_target = NULL; /* pointer to scan for in writable memory */
+
+/* Callback to scan a library's segments for a cached function pointer */
+static int scan_ptr_callback(struct dl_phdr_info* info, size_t size, void* data) {
+    const char* name = info->dlpi_name;
+    if (!name || !*name) return 0;
+    if (!strstr(name, "libunity.so") && !strstr(name, "libGLESv2") && !strstr(name, "libEGL")) return 0;
+    if (!g_scan_target) return 0;
+
+    for (int i = 0; i < info->dlpi_phnum; i++) {
+        const Elf64_Phdr* phdr = &info->dlpi_phdr[i];
+        if (phdr->p_type != PT_LOAD) continue;
+
+        uintptr_t start = info->dlpi_addr + phdr->p_vaddr;
+        size_t sz = phdr->p_memsz;
+        void** ptr = (void**)start;
+        int count = sz / sizeof(void*);
+
+        for (int j = 0; j < count; j++) {
+            if (ptr[j] == g_scan_target) {
+                uintptr_t page = (uintptr_t)&ptr[j] & ~0xFFF;
+                mprotect((void*)page, 0x1000, PROT_READ | PROT_WRITE);
+                *g_patch_real_fn = ptr[j];
+                ptr[j] = g_patch_hook_fn;
+                LOGI("Patched cached %p -> %p at offset %d in %s segment %d (flags=0x%x)",
+                     g_scan_target, g_patch_hook_fn, j, name, i, phdr->p_flags);
+                g_patch_found = 1;
+                /* Keep scanning for more occurrences */
             }
         }
     }
-    return real_eglSwapBuffers(dpy, surface);
+    return 0;
 }
 
-#include <link.h>
-#include <sys/mman.h>
-#include <elf.h>
-
-static int patch_eglSwapBuffers_got(struct dl_phdr_info* info, size_t size, void* data) {
+static int patch_got_callback(struct dl_phdr_info* info, size_t size, void* data) {
     const char* name = info->dlpi_name;
-    if (!name) return 0;
-    /* Only patch libunity.so */
-    if (!strstr(name, "libunity.so")) return 0;
-
-    LOGI("patch_eglSwapBuffers: found %s at %p", name, (void*)info->dlpi_addr);
+    if (!name || !*name) return 0;
+    if (!strstr(name, ".so")) return 0;
+    /* For glBindFramebuffer, try all libs (Unity may load it via eglGetProcAddress) */
 
     Elf64_Sym* symtab = NULL;
     const char* strtab = NULL;
@@ -198,63 +274,169 @@ static int patch_eglSwapBuffers_got(struct dl_phdr_info* info, size_t size, void
             break;
         }
     }
-
-    LOGI("patch_eglSwapBuffers: symtab=%p strtab=%p rel=%p relsz=%zu rela=%p relasz=%zu",
-         symtab, strtab, rel, relsz, rela, relasz);
-
     if (!symtab || !strtab) return 0;
 
-    /* Search JMPREL (PLT relocations) for eglSwapBuffers */
     if (rel && relsz > 0) {
         size_t ent = relent ? relent : sizeof(Elf64_Rel);
         int count = relsz / ent;
-        LOGI("patch_eglSwapBuffers: JMPREL count=%d ent=%zu", count, ent);
         for (int j = 0; j < count; j++) {
             Elf64_Rel* r = (Elf64_Rel*)((char*)rel + j * ent);
             int symidx = ELF64_R_SYM(r->r_info);
             Elf64_Sym* sym = &symtab[symidx];
             const char* symname = strtab + sym->st_name;
-            if (symname && strcmp(symname, "eglSwapBuffers") == 0) {
+            if (symname && strcmp(symname, g_patch_sym_name) == 0) {
                 void** got_entry = (void**)(info->dlpi_addr + r->r_offset);
                 uintptr_t page = (uintptr_t)got_entry & ~0xFFF;
                 mprotect((void*)page, 0x1000, PROT_READ | PROT_WRITE);
-                real_eglSwapBuffers = (EGLBoolean (*)(EGLDisplay, EGLSurface))*got_entry;
-                *got_entry = (void*)hook_eglSwapBuffers;
-                LOGI("Hooked eglSwapBuffers in %s (GOT %p -> %p)", name, got_entry, hook_eglSwapBuffers);
-                g_swap_hook_installed = 1;
-                return 1;
+                if (*got_entry != g_patch_hook_fn) {
+                    *g_patch_real_fn = *got_entry;
+                    *got_entry = g_patch_hook_fn;
+                    LOGI("Hooked %s in %s (GOT %p -> %p)", g_patch_sym_name, name, got_entry, g_patch_hook_fn);
+                    g_patch_found = 1;
+                }
+                return 0; /* continue to next library */
             }
         }
     }
-    /* Search RELA */
     if (rela && relasz > 0) {
         size_t ent = relaent ? relaent : sizeof(Elf64_Rela);
         int count = relasz / ent;
-        LOGI("patch_eglSwapBuffers: RELA count=%d ent=%zu", count, ent);
         for (int j = 0; j < count; j++) {
             Elf64_Rela* r = (Elf64_Rela*)((char*)rela + j * ent);
             int symidx = ELF64_R_SYM(r->r_info);
             Elf64_Sym* sym = &symtab[symidx];
             const char* symname = strtab + sym->st_name;
-            if (symname && strcmp(symname, "eglSwapBuffers") == 0) {
+            if (symname && strcmp(symname, g_patch_sym_name) == 0) {
                 void** got_entry = (void**)(info->dlpi_addr + r->r_offset);
                 uintptr_t page = (uintptr_t)got_entry & ~0xFFF;
                 mprotect((void*)page, 0x1000, PROT_READ | PROT_WRITE);
-                real_eglSwapBuffers = (EGLBoolean (*)(EGLDisplay, EGLSurface))*got_entry;
-                *got_entry = (void*)hook_eglSwapBuffers;
-                LOGI("Hooked eglSwapBuffers in %s (RELA GOT %p)", name, got_entry);
-                g_swap_hook_installed = 1;
-                return 1;
+                if (*got_entry != g_patch_hook_fn) {
+                    *g_patch_real_fn = *got_entry;
+                    *got_entry = g_patch_hook_fn;
+                    LOGI("Hooked %s in %s (RELA GOT %p)", g_patch_sym_name, name, got_entry);
+                    g_patch_found = 1;
+                }
+                return 0; /* continue to next library */
             }
         }
     }
-    LOGI("patch_eglSwapBuffers: eglSwapBuffers not found in relocations");
     return 0;
+}
+
+static int patch_got(const char* sym_name, void** real_fn, void* hook_fn) {
+    g_patch_sym_name = sym_name;
+    g_patch_real_fn = real_fn;
+    g_patch_hook_fn = hook_fn;
+    g_patch_found = 0;
+    dl_iterate_phdr(patch_got_callback, NULL);
+    return g_patch_found;
+}
+
+static EGLBoolean hook_eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
+    static int hook_call_count = 0;
+    if (hook_call_count < 3) {
+        LOGI("hook_eglSwapBuffers called! render_thread=%d", g_render_thread_inited);
+        hook_call_count++;
+    }
+    if (g_render_thread_inited && real_eglSwapBuffers) {
+        for (int i = 0; i < MAX_LAYERS; i++) {
+            if (g_layers[i].in_use) {
+                int w = g_layers[i].width;
+                int h = g_layers[i].height;
+                GLuint tex = g_layers[i].textures[0];
+                if (!g_swap_pixels || g_swap_pix_w != w || g_swap_pix_h != h) {
+                    free(g_swap_pixels);
+                    g_swap_pixels = (unsigned char*)malloc(w * h * 4);
+                    g_swap_pix_w = w;
+                    g_swap_pix_h = h;
+                }
+                GLint prevFbo = 0;
+                glGetIntegerv(GL_FRAMEBUFFER_BINDING, &prevFbo);
+                /* Read from the default framebuffer (window surface back buffer) */
+                glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+                glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, g_swap_pixels);
+                /* Log first pixel for debugging */
+                static int swap_log_count = 0;
+                if (swap_log_count < 5) {
+                    LOGI("hook_eglSwapBuffers: prevFbo=%d pixel[0]=%d,%d,%d,%d size=%dx%d",
+                         prevFbo, g_swap_pixels[0], g_swap_pixels[1],
+                         g_swap_pixels[2], g_swap_pixels[3], w, h);
+                    swap_log_count++;
+                }
+                glBindFramebuffer(GL_FRAMEBUFFER, prevFbo);
+                glBindTexture(GL_TEXTURE_2D_ARRAY, tex);
+                glTexSubImage3D(GL_TEXTURE_2D_ARRAY, 0, 0, 0, 0, w, h, 1,
+                                GL_RGBA, GL_UNSIGNED_BYTE, g_swap_pixels);
+                glTexSubImage3D(GL_TEXTURE_2D_ARRAY, 0, 0, 0, 1, w, h, 1,
+                                GL_RGBA, GL_UNSIGNED_BYTE, g_swap_pixels);
+                glBindTexture(GL_TEXTURE_2D_ARRAY, 0);
+                break;
+            }
+        }
+    }
+    return real_eglSwapBuffers(dpy, surface);
 }
 
 static void install_swap_hook() {
     if (g_swap_hook_installed) return;
-    dl_iterate_phdr(patch_eglSwapBuffers_got, NULL);
+    FLOG("install_swap_hook: installing hooks");
+    /* Hook eglGetProcAddress in libunity.so to intercept GL function lookups.
+       Unity loads glBindFramebuffer via eglGetProcAddress, not through PLT,
+       so GOT patching of glBindFramebuffer directly won't work for libunity.so. */
+    if (!g_fbo_hook_installed) {
+        int found = patch_got("eglGetProcAddress", (void**)&real_eglGetProcAddress, (void*)hook_eglGetProcAddress);
+        FLOGI("install_swap_hook: eglGetProcAddress patch_got result=", found);
+        if (found) {
+            g_fbo_hook_installed = 1;
+            LOGI("eglGetProcAddress hook installed");
+            FLOG("install_swap_hook: eglGetProcAddress hook installed");
+        } else {
+            FLOG("install_swap_hook: eglGetProcAddress NOT found in PLT");
+        }
+    }
+    /* Also hook glBindFramebuffer in libs that do use PLT (e.g. libPvr_UnitySDK.so) */
+    if (!g_fbo_hook_installed) {
+        int found = patch_got("glBindFramebuffer", (void**)&real_glBindFramebuffer, (void*)hook_glBindFramebuffer);
+        FLOGI("install_swap_hook: glBindFramebuffer patch_got result=", found);
+        if (found) {
+            g_fbo_hook_installed = 1;
+            LOGI("glBindFramebuffer hook installed");
+            FLOG("install_swap_hook: glBindFramebuffer hook installed");
+        }
+    }
+    /* Also try to find and patch Unity's cached glBindFramebuffer pointer.
+       Unity loads GL funcs via eglGetProcAddress and caches them in .data/.bss.
+       The eglGetProcAddress hook above only intercepts FUTURE calls, but Unity
+       already cached the pointer. Scan libunity.so's writable segments for the
+       real pointer and replace it with our wrapper. */
+    {
+        void* real_fn = (void*)eglGetProcAddress("glBindFramebuffer");
+        FLOGI("install_swap_hook: real glBindFramebuffer=", (int)(uintptr_t)real_fn);
+        if (real_fn) {
+            g_patch_real_fn = (void**)&real_glBindFramebuffer_ptr;
+            g_patch_hook_fn = (void*)hook_glBindFramebuffer_ptr;
+            g_patch_sym_name = NULL;
+            g_patch_found = 0;
+            g_scan_target = real_fn;
+            dl_iterate_phdr(scan_ptr_callback, NULL);
+            if (g_patch_found) {
+                LOGI("glBindFramebuffer pointer patched in libunity.so");
+                FLOG("install_swap_hook: glBindFramebuffer pointer patched");
+            } else {
+                FLOG("install_swap_hook: glBindFramebuffer pointer NOT found in libunity.so");
+            }
+        }
+    }
+    /* Also hook eglSwapBuffers in libunity.so to capture Unity's output */
+    {
+        int found = patch_got("eglSwapBuffers", (void**)&real_eglSwapBuffers, (void*)hook_eglSwapBuffers);
+        FLOGI("install_swap_hook: eglSwapBuffers patch_got result=", found);
+        if (found) {
+            LOGI("eglSwapBuffers hook installed");
+            FLOG("install_swap_hook: eglSwapBuffers hook installed");
+        }
+    }
+    g_swap_hook_installed = 1;
 }
 
 /* GL multiview extension function pointers */
@@ -402,14 +584,91 @@ static int load_pvr_runtime() {
     LOAD("Pvr_SetCurrentRenderTexture", SetCurrentRenderTexture);
     LOAD("Pvr_EnableSinglePass", EnableSinglePass);
     LOAD("PVR_CameraEndFrame_", CameraEndFrame);
+    LOAD("PVR_BothEyeEndFrameFU", BothEyeEndFrameFU);
     LOAD("PVR_TimeWarpEvent_", TimeWarpEvent);
     LOAD("UnityRenderEvent", RenderEvent);
+    /* Wrap RenderEvent so we can blit from Unity's FBO to the eye
+       texture before the PVR SDK processes the frame. */
+    if (pvr.RenderEvent) {
+        pvr_real_RenderEvent = pvr.RenderEvent;
+        pvr.RenderEvent = wrapped_RenderEvent;
+        LOGI("wrapped RenderEvent: real=%p wrapper=%p",
+             pvr_real_RenderEvent, pvr.RenderEvent);
+    }
     LOAD("Pvr_GetPsensorState", GetPsensorState);
     LOAD("Pvr_GetSensorState", GetSensorState);
     LOAD("Pvr_SetCurrentHMDType", SetCurrentHMDType);
     LOAD("Pvr_GetSupportHMDTypes", GetSupportHMDTypes);
     LOAD("Pvr_ChangeScreenParameters", ChangeScreenParameters);
     #undef LOAD
+
+    /* The compat lib's interface table (PVR_CameraEndFrame_interface, etc.)
+       is never populated because the PICO system's init code doesn't run.
+       Load libPvr_UESDKExt2.so and wire up the interface pointers so the
+       compat lib's thunk functions dispatch to the real implementations. */
+    void* ext2 = dlopen("libPvr_UESDKExt2.so", RTLD_NOW | RTLD_GLOBAL);
+    if (!ext2) ext2 = dlopen("/system/lib64/libPvr_UESDKExt2.so", RTLD_NOW | RTLD_GLOBAL);
+    if (ext2) {
+        LOGI("loaded libPvr_UESDKExt2.so for interface wiring");
+        FLOG("load_pvr_runtime: loaded ext2 for interface wiring");
+        /* The ext2 lib needs VrLibJavaVM set via pvr_OnLoad, otherwise
+           PVR_InitRenderThread_ aborts with "pvr_OnLoad() not called yet". */
+        if (g_jvm) {
+            typedef int (*pvr_OnLoad_t)(JavaVM*);
+            pvr_OnLoad_t ext2_onload = (pvr_OnLoad_t)dlsym(ext2, "pvr_OnLoad");
+            if (ext2_onload) {
+                int ret = ext2_onload(g_jvm);
+                LOGI("ext2 pvr_OnLoad returned %d", ret);
+            } else {
+                JavaVM** vm_ptr = (JavaVM**)dlsym(ext2, "VrLibJavaVM");
+                if (vm_ptr) *vm_ptr = g_jvm;
+                LOGI("set ext2 VrLibJavaVM manually");
+            }
+        }
+        /* Both libs have a global "up" pointer to the main PVR struct.
+           The compat lib's PVR_InitRenderThread_ allocates and sets it.
+           The ext2 lib's functions (CameraEndFrame, TimeWarpEvent) read
+           from ext2's own "up" which is still null. We need to sync them
+           after the compat lib's init runs. This is done in Pxr_Initialize
+           after calling pvr.Init(). For now, just save the ext2 handle. */
+        pvr.ext2_handle = ext2;
+        /* For each interface symbol in the compat lib, resolve the
+           matching function in ext2 and store it.
+           Only wire up functions that don't need Java objects - the
+           render thread init and event handlers stay on the compat lib. */
+        const char* iface_names[] = {
+            "PVR_CameraEndFrame",
+            "PVR_BoundaryRender",
+            "PVR_CameraEndFrameItf",
+            "PvrBeginEyeEvent", "PvrEndEyeEvent",
+            "PVR_GetCpuLevel", "PVR_SetCpuLevel",
+            "PVR_GetGpuLevel", "PVR_SetGpuLevel",
+            "PVR_GetGpuUtilization",
+            "PVR_GetHmdBatteryLevel", "PVR_GetHmdBatteryStatus",
+            "PVR_GetHmdBatteryTemperature", "PVR_SetHmdAudioStatus",
+            "PVR_SetUnrealParam",
+            NULL
+        };
+        int wired = 0;
+        for (int i = 0; iface_names[i]; i++) {
+            char sym[128];
+            snprintf(sym, sizeof(sym), "%s_interface", iface_names[i]);
+            void** iface_ptr = (void**)dlsym(pvr.handle, sym);
+            if (!iface_ptr) continue;
+            void* func = dlsym(ext2, iface_names[i]);
+            if (func) {
+                *iface_ptr = func;
+                wired++;
+                if (wired <= 5)
+                    LOGI("wired %s -> %p", sym, func);
+            }
+        }
+        LOGI("wired %d PVR interfaces to libPvr_UESDKExt2.so", wired);
+        FLOGI("load_pvr_runtime: wired ", wired);
+    } else {
+        LOGW("failed to load libPvr_UESDKExt2.so: %s", dlerror());
+        FLOG("load_pvr_runtime: FAILED to load ext2");
+    }
 
     return 0;
 }
@@ -533,6 +792,14 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* reserved) {
         FLOG("JNI_OnLoad: init_requested but g_initialized check");
     }
     FLOG("JNI_OnLoad done");
+
+    /* Install eglGetProcAddress hook EARLY, before Unity loads GL functions.
+       Unity calls eglGetProcAddress to get GL function pointers. By hooking
+       it now, we can intercept glBindFramebuffer and redirect FBO 0 to the
+       eye texture. */
+    install_swap_hook();
+    FLOG("JNI_OnLoad: install_swap_hook called early");
+
     return JNI_VERSION_1_6;
 }
 
@@ -859,7 +1126,8 @@ JNIEXPORT int Pxr_CreateLayer(void* layerParamPtr) {
 
     FLOG("Pxr_CreateLayer step 6: glGenTextures");
     /* Create swapchain textures. For multiview layers (arraySize>=2),
-       use GL_TEXTURE_2D_ARRAY with 2 layers for stereo rendering. */
+       use GL_TEXTURE_2D_ARRAY with 2 layers - Unity's PXR plugin uses
+       glFramebufferTextureMultiviewOVR to attach them. */
     glGenTextures(SWAPCHAIN_LEN, g_layers[slot].textures);
     FLOG("Pxr_CreateLayer step 7: textures created");
     for (int i = 0; i < SWAPCHAIN_LEN; i++) {
@@ -887,7 +1155,14 @@ JNIEXPORT int Pxr_CreateLayer(void* layerParamPtr) {
     LOGI("Pxr_CreateLayer -> slot %d, textures [%u, %u]",
          slot, g_layers[slot].textures[0], g_layers[slot].textures[1]);
 
-    if (p) p->layerId = slot;
+    if (p) {
+        p->layerId = slot;
+        /* Update arraySize to match what we actually created.
+           Unity's PXR plugin reads this to decide whether to use
+           glFramebufferTextureMultiviewOVR (arraySize>=2) or
+           glFramebufferTexture2D (arraySize=1). */
+        p->arraySize = arraySize;
+    }
 
     FLOG("Pxr_CreateLayer step 9: auto-start XR");
     /* Auto-start XR if not already running - the game creates a layer
@@ -898,8 +1173,6 @@ JNIEXPORT int Pxr_CreateLayer(void* layerParamPtr) {
     }
 
     FLOG("Pxr_CreateLayer step 10: init render thread");
-    /* Set up the layer textures for PVR TimeWarp and init render thread.
-       We're on the render thread so EGL context is available. */
     EGLContext ctx = eglGetCurrentContext();
     EGLDisplay dpy = eglGetCurrentDisplay();
     FLOGI("Pxr_CreateLayer: EGL ctx=", (int)(uintptr_t)ctx);
@@ -910,6 +1183,32 @@ JNIEXPORT int Pxr_CreateLayer(void* layerParamPtr) {
         g_render_thread_inited = 1;
         LOGI("PVR render thread init returned");
         install_swap_hook();
+        /* Sync the "up" struct pointer from compat lib to ext2 lib.
+           Both libs have a global "up" that points to the main PVR struct.
+           The compat lib's InitRenderThread allocated and set it.
+           The ext2 lib's functions need the same pointer. */
+        if (pvr.ext2_handle) {
+            /* Both libs have a global "up" struct (the main PVR state).
+               They're in separate BSS sections. We need ext2's functions
+               to access the same struct as the compat lib.
+               Patch ext2's GOT entry for "up" to point to compat's "up". */
+            void* compat_up = dlsym(pvr.handle, "up");
+            void* ext2_up = dlsym(pvr.ext2_handle, "up");
+            if (compat_up && ext2_up) {
+                /* Calculate ext2's base address from the "up" symbol offset */
+                const uintptr_t ext2_up_offset = 0x1ddde0;
+                uintptr_t ext2_base = (uintptr_t)ext2_up - ext2_up_offset;
+                /* The GOT entry for "up" is at offset 0x1c9178 in ext2 */
+                void** got_entry = (void**)(ext2_base + 0x1c9178);
+                /* Make the GOT page writable */
+                uintptr_t page = (uintptr_t)got_entry & ~0xFFF;
+                mprotect((void*)page, 0x1000, PROT_READ | PROT_WRITE);
+                /* Overwrite the GOT entry to point to compat's "up" */
+                *got_entry = compat_up;
+                LOGI("patched ext2 GOT: up entry %p -> compat up %p", got_entry, compat_up);
+                FLOG("Pxr_CreateLayer: patched ext2 GOT for up");
+            }
+        }
     }
     FLOG("Pxr_CreateLayer step 11: render thread done");
 
@@ -918,106 +1217,30 @@ JNIEXPORT int Pxr_CreateLayer(void* layerParamPtr) {
        Get the ANativeWindow from the Activity's ViewRootImpl.mSurface
        and call initialize() to create the EGL surface. */
     if (g_render_thread_inited) {
-        typedef void (*initialize_t)(void*);
-        initialize_t init_fn = (initialize_t)dlsym(pvr.handle, "_Z10initializeP13ANativeWindow");
-        if (init_fn) {
-            JNIEnv* env = get_env();
-            if (env) {
-                /* Get the current Activity via ActivityThread */
-                jclass at_cls = (*env)->FindClass(env, "android/app/ActivityThread");
-                if (at_cls) {
-                    jmethodID cat = (*env)->GetStaticMethodID(env, at_cls,
-                        "currentActivityThread", "()Landroid/app/ActivityThread;");
-                    jobject at_obj = (*env)->CallStaticObjectMethod(env, at_cls, cat);
-                    if (at_obj) {
-                        jfieldID mf = (*env)->GetFieldID(env, at_cls,
-                            "mActivities", "Landroid/util/ArrayMap;");
-                        if (mf) {
-                            jobject map = (*env)->GetObjectField(env, at_obj, mf);
-                            if (map) {
-                                jclass map_cls = (*env)->GetObjectClass(env, map);
-                                jmethodID size_m = (*env)->GetMethodID(env, map_cls, "size", "()I");
-                                jmethodID val_m = (*env)->GetMethodID(env, map_cls, "valueAt", "(I)Ljava/lang/Object;");
-                                int n = (*env)->CallIntMethod(env, map, size_m);
-                                if (n > 0) {
-                                    jobject record = (*env)->CallObjectMethod(env, map, val_m, 0);
-                                    if (record) {
-                                        jclass rec_cls = (*env)->GetObjectClass(env, record);
-                                        jfieldID act_f = (*env)->GetFieldID(env, rec_cls,
-                                            "activity", "Landroid/app/Activity;");
-                                        if (act_f) {
-                                            jobject activity = (*env)->GetObjectField(env, record, act_f);
-                                            if (activity) {
-                                                /* Activity -> getWindow() -> getDecorView()
-                                                   -> getViewRootImpl() -> mSurface */
-                                                jclass act_cls = (*env)->GetObjectClass(env, activity);
-                                                jmethodID gw = (*env)->GetMethodID(env, act_cls,
-                                                    "getWindow", "()Landroid/view/Window;");
-                                                jobject window = (*env)->CallObjectMethod(env, activity, gw);
-                                                if (window) {
-                                                    jclass win_cls = (*env)->GetObjectClass(env, window);
-                                                    jmethodID gdv = (*env)->GetMethodID(env, win_cls,
-                                                        "getDecorView", "()Landroid/view/View;");
-                                                    jobject decor = (*env)->CallObjectMethod(env, window, gdv);
-                                                    if (decor) {
-                                                        jclass view_cls = (*env)->GetObjectClass(env, decor);
-                                                        jmethodID gvr = (*env)->GetMethodID(env, view_cls,
-                                                            "getViewRootImpl", "()Landroid/view/ViewRootImpl;");
-                                                        jobject vroot = (*env)->CallObjectMethod(env, decor, gvr);
-                                                        if (vroot) {
-                                                            jclass vr_cls = (*env)->GetObjectClass(env, vroot);
-                                                            jfieldID sf = (*env)->GetFieldID(env, vr_cls,
-                                                                "mSurface", "Landroid/view/Surface;");
-                                                            if (sf) {
-                                                                jobject surface = (*env)->GetObjectField(env, vroot, sf);
-                                                                if (surface) {
-                                                                    void* (*ANW_fromSurface)(JNIEnv*, jobject) =
-                                                                        (void*(*)(JNIEnv*, jobject))
-                                                                        dlsym(RTLD_DEFAULT, "ANativeWindow_fromSurface");
-                                                                    if (ANW_fromSurface) {
-                                                                        void* anw = ANW_fromSurface(env, surface);
-                                                                        FLOGI("Pxr_CreateLayer: ANativeWindow=", (int)(uintptr_t)anw);
-                                                                        if (anw) {
-                                                                            init_fn(anw);
-                                                                            FLOG("Pxr_CreateLayer: initialize() called");
-                                                                        }
-                                                                    }
-                                                                }
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        /* Skip initialize() - it takes over Unity's window surface and
+           causes DequeueBuffer errors. Test if Unity can render without it. */
+        FLOG("Pxr_CreateLayer: skipping initialize() to preserve Unity surface");
     }
 
     if (pvr.SetupLayerData && pvr.RenderEvent) {
         float colorScaleOffset[8] = {1, 1, 1, 1, 0, 0, 0, 0};
         GLuint tex = g_layers[slot].textures[0];
-        /* PVR SDK uses GL enum values for textureType:
-           GL_TEXTURE_2D=0x0DE1, GL_TEXTURE_2D_ARRAY=0x910A */
         int texType = is_multiview ? 0x910A : 0x0DE1;
         LOGI("setting up PVR layer data with tex %u (type 0x%x, mv=%d)", tex, texType, is_multiview);
 
+        /* Save GL state before FBO clear */
+        GLint savedFbo = 0, savedViewport[4] = {0};
+        glGetIntegerv(GL_FRAMEBUFFER_BINDING, &savedFbo);
+        glGetIntegerv(GL_VIEWPORT, savedViewport);
+
         /* Clear textures to a solid color via FBO so TimeWarp has valid
-           eye buffers. Without this, TimeWarp rejects them as "No valid
-           Eye Buffers" because they've never been rendered to. */
+           eye buffers. */
         GLuint fbo;
         glGenFramebuffers(1, &fbo);
         glBindFramebuffer(GL_FRAMEBUFFER, fbo);
-        if (is_multiview) {
-            if (g_glFramebufferTextureMultiview) {
-                g_glFramebufferTextureMultiview(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
-                    tex, 0, 0, arraySize);
-            }
+        if (is_multiview && g_glFramebufferTextureMultiview) {
+            g_glFramebufferTextureMultiview(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                tex, 0, 0, arraySize);
         } else {
             glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
                 GL_TEXTURE_2D, tex, 0);
@@ -1034,6 +1257,10 @@ JNIEXPORT int Pxr_CreateLayer(void* layerParamPtr) {
         }
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
         glDeleteFramebuffers(1, &fbo);
+
+        /* Restore GL state */
+        glBindFramebuffer(GL_FRAMEBUFFER, savedFbo);
+        glViewport(savedViewport[0], savedViewport[1], savedViewport[2], savedViewport[3]);
 
         /* Set current render texture before SetupLayerData - PVR SDK
            requires this to know which texture to use for each eye.
@@ -1053,10 +1280,16 @@ JNIEXPORT int Pxr_CreateLayer(void* layerParamPtr) {
             }
             int* g_iSinglePassTexID = (int*)dlsym(pvr.handle, "g_iSinglePassTexID");
             if (g_iSinglePassTexID) {
+                FLOGI("Pxr_CreateLayer: PVR SDK g_iSinglePassTexID before set=", *g_iSinglePassTexID);
                 *g_iSinglePassTexID = tex;
                 FLOGI("Pxr_CreateLayer: g_iSinglePassTexID=", (int)tex);
             }
         }
+
+        /* Save GL state before SetupLayerData (it changes GL state) */
+        GLint savedFbo2 = 0, savedViewport2[4] = {0};
+        glGetIntegerv(GL_FRAMEBUFFER_BINDING, &savedFbo2);
+        glGetIntegerv(GL_VIEWPORT, savedViewport2);
 
         if (is_multiview) {
             /* Multiview: single texture array, store for both eyes */
@@ -1073,86 +1306,41 @@ JNIEXPORT int Pxr_CreateLayer(void* layerParamPtr) {
             pvr.CameraEndFrame(1, is_multiview ? tex : g_layers[slot].textures[1]);
             FLOG("Pxr_CreateLayer: CameraEndFrame called");
         }
-        /* Also set textures directly in the PVR structure, in case
-           CameraEndFrame_ skips due to the flag at offset 104 being 0.
-           Read the actual struct pointer from the GOT entry. */
+
+        /* Restore GL state after SetupLayerData/CameraEndFrame */
+        glBindFramebuffer(GL_FRAMEBUFFER, savedFbo2);
+        glViewport(savedViewport2[0], savedViewport2[1], savedViewport2[2], savedViewport2[3]);
+        /* Set texture IDs in the up struct (from Ghidra decompilation). */
         {
-            char* evbuf = (char*)dlsym(pvr.handle, "eventBuffer");
-            if (evbuf) {
-                /* GOT entry at link-time 0x1fa100 contains the struct pointer.
-                   eventBuffer is at link-time 0x210000.
-                   GOT offset from eventBuffer = 0x1fa100 - 0x210000 = -0x15F00 */
-                char** got_entry = (char**)(evbuf - 0x15F00);
-                char* pvr_struct = *got_entry;
-                FLOGI("Pxr_CreateLayer: evbuf=", (int)(uintptr_t)evbuf);
-                FLOGI("Pxr_CreateLayer: pvr_struct=", (int)(uintptr_t)pvr_struct);
-                if (pvr_struct) {
-                    pvr_struct[104] = 1;
-                    *(int*)(pvr_struct + 76) = tex;
-                    *(int*)(pvr_struct + 80) = is_multiview ? tex : g_layers[slot].textures[1];
-                    /* Clear overlay model flags. PVR_TimeWarpEvent_ checks
-                       struct[0xdabc] (==1 → overlay, ==0 → eyebuffer).
-                       Also clear struct[0xda98] and struct[0x5364]. */
-                    *(int*)(pvr_struct + 0xdabc) = 0;
-                    *(int*)(pvr_struct + 0xda98) = 0;
-                    *(int*)(pvr_struct + 0x5364) = 0;
-                    /* Set the flag at struct[0xd810] so the eyebuffer path
-                       is taken without needing struct[80] to be checked. */
-                    *(unsigned char*)(pvr_struct + 0xd810) = 1;
-                    /* Store texture IDs at offsets read by UnityRenderEvent_.
-                       BOTH_EYE_END_FRAME reads [struct+0xf960]+[struct+0xf964]
-                         and passes the sum to PVR_CameraEndFrame as texture ID.
-                       TIMEWARP reads [struct+0xf928]+[struct+0xf92c]
-                         and passes the sum to PVR_TimeWarpEvent as a parameter.
-                       PVR_TimeWarpEvent_ checks parameter <= 63 and exits
-                         early if not. This parameter is NOT the texture ID -
-                         it's a small frame/sequence value. Store 0 there. */
-                    *(int*)(pvr_struct + 0xf960) = tex;
-                    *(int*)(pvr_struct + 0xf964) = 0;
-                    *(int*)(pvr_struct + 0xf928) = 0;
-                    *(int*)(pvr_struct + 0xf92c) = 0;
-                    /* Also store right eye texture for non-multiview */
-                    if (!is_multiview) {
-                        *(int*)(pvr_struct + 0xf918) = g_layers[slot].textures[1];
-                        *(int*)(pvr_struct + 0xf91c) = 0;
-                    }
-                    FLOG("Pxr_CreateLayer: set struct flag+tex via GOT");
-                }
+            char* s = (char*)dlsym(pvr.handle, "up");
+            FLOGI("Pxr_CreateLayer: up=", (int)(uintptr_t)s);
+            if (s) {
+                *(unsigned char*)(s + 0x68) = 1;
+                *(int*)(s + 0xf960) = tex;
+                *(int*)(s + 0xf964) = 0;
+                *(int*)(s + 0xf928) = tex;
+                *(int*)(s + 0xf92c) = 0;
+                *(int*)(s + 0xf918) = tex;
+                *(int*)(s + 0xf91c) = 0;
+                *(int*)(s + 0xf920) = tex;
+                *(int*)(s + 0xf924) = 0;
+                *(unsigned char*)(s + 0xd810) = 1;
+                *(int*)(s + 0xdabc) = 0;
+                *(int*)(s + 0xda98) = 0;
+                LOGI("Pxr_CreateLayer: set up+0xf960=%d up+0xf928=%d up+0x68=%d",
+                     *(int*)(s + 0xf960), *(int*)(s + 0xf928),
+                     *(unsigned char*)(s + 0x68));
+                FLOG("Pxr_CreateLayer: set struct flags+tex");
             }
         }
         /* Submit frame via UnityRenderEvent_ (bypasses message queue).
            Call BOTH_EYE_END_FRAME to set eye textures, then TIMEWARP. */
         if (pvr.RenderEvent) {
-            /* Check overlay flag before rendering */
-            {
-                char* evbuf = (char*)dlsym(pvr.handle, "eventBuffer");
-                if (evbuf) {
-                    char** got_entry = (char**)(evbuf - 0x15F00);
-                    char* s = *got_entry;
-                    if (s) {
-                        FLOGI("Pxr_CreateLayer: pre-render dabc=", *(int*)(s + 0xdabc));
-                    }
-                }
-            }
             pvr.RenderEvent(RENDER_EVENT_BOTH_EYE_END_FRAME);
-            /* Check overlay flag after BOTH_EYE */
-            {
-                char* evbuf = (char*)dlsym(pvr.handle, "eventBuffer");
-                if (evbuf) {
-                    char** got_entry = (char**)(evbuf - 0x15F00);
-                    char* s = *got_entry;
-                    if (s) {
-                        FLOGI("Pxr_CreateLayer: post-both-eye dabc=", *(int*)(s + 0xdabc));
-                        /* Force-clear overlay flag right before TIMEWARP */
-                        *(int*)(s + 0xdabc) = 0;
-                        *(unsigned char*)(s + 0xd810) = 1;
-                        FLOGI("Pxr_CreateLayer: post-clear dabc=", *(int*)(s + 0xdabc));
-                    }
-                }
-            }
             pvr.RenderEvent(RENDER_EVENT_TIMEWARP);
             FLOG("Pxr_CreateLayer: RenderEvent BOTH_EYE+TIMEWARP called");
         }
+        LOGI("submitted first frame to PVR TimeWarp");
         LOGI("submitted first frame to PVR TimeWarp");
     }
     FLOG("Pxr_CreateLayer step 12: layer data submitted");
@@ -1161,6 +1349,15 @@ JNIEXPORT int Pxr_CreateLayer(void* layerParamPtr) {
        from the same thread as Pxr_CreateLayer, ensuring GL context
        compatibility). No background thread needed. */
 
+    /* Check for pending GL errors before returning */
+    {
+        GLenum err = glGetError();
+        while (err != GL_NO_ERROR) {
+            LOGE("Pxr_CreateLayer: pending GL error 0x%x before return", err);
+            FLOGI("Pxr_CreateLayer: pending GL error=", (int)err);
+            err = glGetError();
+        }
+    }
     LOGI("Pxr_CreateLayer returning slot %d", slot);
     FLOG("Pxr_CreateLayer returning");
     return slot;
@@ -1204,13 +1401,16 @@ JNIEXPORT int Pxr_GetLayerNextImageIndex(int layerId, int* imageIndex) {
 }
 
 JNIEXPORT int Pxr_GetLayerImage(int layerId, int eye, int imageIndex, unsigned long long* image) {
+    LOGI("Pxr_GetLayerImage(%d, eye=%d, idx=%d)", layerId, eye, imageIndex);
+    FLOGI("Pxr_GetLayerImage eye=", eye);
+    FLOGI("Pxr_GetLayerImage idx=", imageIndex);
     if (layerId < 0 || layerId >= MAX_LAYERS || !g_layers[layerId].in_use)
         return -1;
     if (imageIndex < 0 || imageIndex >= SWAPCHAIN_LEN)
         return -1;
     if (image) *image = (unsigned long long)g_layers[layerId].textures[imageIndex];
     LOGI("Pxr_GetLayerImage(%d, %d, %d) -> %llu", layerId, eye, imageIndex, image ? *image : 0);
-    FLOG("Pxr_GetLayerImage");
+    FLOGI("Pxr_GetLayerImage -> tex=", (int)g_layers[layerId].textures[imageIndex]);
     return 0;
 }
 
@@ -1514,6 +1714,20 @@ JNIEXPORT int Pxr_GetConfigInt(int configIndex, int* value) {
         LOGI("Pxr_GetConfigInt(%d) [UnityLogLevel] -> 2", configIndex);
         FLOG("Pxr_GetConfigInt(8)->2");
         return 0;
+    case 13:
+        /* Unknown config - might be a feature flag for display subsystem.
+           Return 1 to enable. */
+        *value = 1;
+        LOGI("Pxr_GetConfigInt(%d) [13] -> 1", configIndex);
+        FLOG("Pxr_GetConfigInt(13)->1");
+        return 0;
+    case 25:
+        /* Unknown config - might be a feature flag for display subsystem.
+           Return 1 to enable. */
+        *value = 1;
+        LOGI("Pxr_GetConfigInt(%d) [25] -> 1", configIndex);
+        FLOG("Pxr_GetConfigInt(25)->1");
+        return 0;
     default:
         *value = 0;
         LOGI("Pxr_GetConfigInt(%d) -> default 0", configIndex);
@@ -1630,59 +1844,138 @@ JNIEXPORT int Pxr_PollEvent(void* event) {
                         pvr.SetupLayerData(0, 2, g_layers[i].textures[1], 0x0DE1, 0, colorScaleOffset);
                     }
                 }
-                /* Call PVR_CameraEndFrame_ directly to set eye textures.
-                   The event queue is empty because nothing pushes to it,
-                   so UnityRenderEvent(BOTH_EYE_END_FRAME) does nothing.
-                   Bypass the queue by setting textures directly. */
-                if (pvr.CameraEndFrame) {
+                /* Set texture IDs in the up struct before calling PVR functions.
+                   From Ghidra: BothEyeEndFrameFU and CameraEndFrame write to
+                   up+0x4c/0x50, TimeWarp reads up+0x4c/0x50 and copies to
+                   up+0x90. We set the source fields the render events read. */
+                {
+                    char* s = (char*)dlsym(pvr.handle, "up");
+                    if (s) {
+                        *(unsigned char*)(s + 0x68) = 1;
+                        *(int*)(s + 0xf960) = tex;
+                        *(int*)(s + 0xf964) = 0;
+                        /* up+0xf928 is a frame index (must be <= 63), NOT tex */
+                        *(int*)(s + 0xf928) = 0;
+                        *(int*)(s + 0xf92c) = 0;
+                        *(unsigned char*)(s + 0xd810) = 1;
+                        *(int*)(s + 0xdabc) = 0;
+                        *(int*)(s + 0xda98) = 0;
+                        static int poll_struct_log = 0;
+                        if (poll_struct_log < 3) {
+                            LOGI("Pxr_PollEvent: set up+0xf960=%d up+0x68=%d",
+                                 *(int*)(s + 0xf960), *(unsigned char*)(s + 0x68));
+                            poll_struct_log++;
+                        }
+                    }
+                }
+                /* Call PVR_BothEyeEndFrameFU to set eye textures.
+                   This calls PVR_CameraEndFrame for both eyes + depth + boundary. */
+                if (pvr.BothEyeEndFrameFU) {
+                    pvr.BothEyeEndFrameFU(tex, 0, 0);
+                    LOGI("Pxr_PollEvent: BothEyeEndFrameFU(%d, 0, 0) called", tex);
+                } else if (pvr.CameraEndFrame) {
                     pvr.CameraEndFrame(0, tex);
                     pvr.CameraEndFrame(1, g_layers[i].is_multiview ? tex : g_layers[i].textures[1]);
                 }
-                /* Also set textures directly in the PVR structure via GOT */
+                /* Read eye texture content and Unity's FBO for debugging */
                 {
-                    char* evbuf = (char*)dlsym(pvr.handle, "eventBuffer");
-                    if (evbuf) {
-                        char** got_entry = (char**)(evbuf - 0x15F00);
-                        char* pvr_struct = *got_entry;
-                        if (pvr_struct) {
-                            pvr_struct[104] = 1;
-                            *(int*)(pvr_struct + 76) = tex;
-                            *(int*)(pvr_struct + 80) = g_layers[i].is_multiview ? tex : g_layers[i].textures[1];
-                            *(int*)(pvr_struct + 0xdabc) = 0;
-                            *(int*)(pvr_struct + 0xda98) = 0;
-                            *(int*)(pvr_struct + 0x5364) = 0;
-                            *(unsigned char*)(pvr_struct + 0xd810) = 1;
-                            *(int*)(pvr_struct + 0xf960) = tex;
-                            *(int*)(pvr_struct + 0xf964) = 0;
-                            *(int*)(pvr_struct + 0xf928) = 0;
-                            *(int*)(pvr_struct + 0xf92c) = 0;
-                            if (!g_layers[i].is_multiview) {
-                                *(int*)(pvr_struct + 0xf918) = g_layers[i].textures[1];
-                                *(int*)(pvr_struct + 0xf91c) = 0;
-                            }
+                    GLint prevFbo = 0;
+                    glGetIntegerv(GL_FRAMEBUFFER_BINDING, &prevFbo);
+                    static int eye_read_log = 0;
+                    if (eye_read_log < 10) {
+                        unsigned char pix[4] = {0};
+                        void (*realBind)(GLenum, GLuint) = real_glBindFramebuffer ? real_glBindFramebuffer : glBindFramebuffer;
+                        if (g_eye_fbo) {
+                            realBind(GL_READ_FRAMEBUFFER, g_eye_fbo);
+                            glReadPixels(0, 0, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, pix);
+                            LOGI("Pxr_PollEvent: eyeFBO=%d pixel=%d,%d,%d,%d",
+                                 g_eye_fbo, pix[0], pix[1], pix[2], pix[3]);
                         }
+                        if (prevFbo > 0) {
+                            realBind(GL_READ_FRAMEBUFFER, prevFbo);
+                            glReadPixels(0, 0, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, pix);
+                            LOGI("Pxr_PollEvent: prevFbo=%d pixel=%d,%d,%d,%d",
+                                 prevFbo, pix[0], pix[1], pix[2], pix[3]);
+                        }
+                        realBind(GL_READ_FRAMEBUFFER, prevFbo);
+                        eye_read_log++;
                     }
                 }
-                /* Submit frame via UnityRenderEvent_ */
+                /* Submit frame via wrapped render event.
+                   Save/restore GL state around the render events because
+                   the PVR SDK's event handlers change FBO bindings, viewport,
+                   etc. Without restoring, Unity's subsequent rendering fails
+                   with GL_INVALID_FRAMEBUFFER_OPERATION. */
+                LOGI("Pxr_PollEvent: before RenderEvent check, pvr.RenderEvent=%p", pvr.RenderEvent);
                 if (pvr.RenderEvent) {
-                    pvr.RenderEvent(RENDER_EVENT_BOTH_EYE_END_FRAME);
-                    /* Clear overlay flag between BOTH_EYE and TIMEWARP */
+                    /* Save GL state */
+                    GLint savedFbo = 0, savedViewport[4] = {0};
+                    glGetIntegerv(GL_FRAMEBUFFER_BINDING, &savedFbo);
+                    glGetIntegerv(GL_VIEWPORT, savedViewport);
+                    GLint savedReadFbo = 0, savedDrawFbo = 0;
+                    glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &savedReadFbo);
+                    glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &savedDrawFbo);
+
+                    wrapped_RenderEvent(RENDER_EVENT_BOTH_EYE_END_FRAME);
+                    /* Set LE_TexID before TIMEWARP */
                     {
-                        char* evbuf = (char*)dlsym(pvr.handle, "eventBuffer");
-                        if (evbuf) {
-                            char** got_entry = (char**)(evbuf - 0x15F00);
-                            char* s = *got_entry;
-                            if (s) {
-                                *(int*)(s + 0xdabc) = 0;
-                                *(int*)(s + 0xda98) = 0;
-                                *(unsigned char*)(s + 0xd810) = 1;
-                            }
+                        char* s = (char*)dlsym(pvr.handle, "up");
+                        if (s) {
+                            *(int*)(s + 0x90) = tex;
+                            *(int*)(s + 0x2390) = g_layers[i].is_multiview ? tex : g_layers[i].textures[1];
+                            *(int*)(s + 0xdabc) = 0;
+                            *(int*)(s + 0xda98) = 0;
+                            *(unsigned char*)(s + 0xd810) = 1;
                         }
                     }
-                    pvr.RenderEvent(RENDER_EVENT_TIMEWARP);
+                    wrapped_RenderEvent(RENDER_EVENT_TIMEWARP);
+                    /* Re-set LE_TexID AFTER TIMEWARP (which resets it to 0)
+                       so the PVR SDK's ATW thread can read it. */
+                    {
+                        char* s = (char*)dlsym(pvr.handle, "up");
+                        if (s) {
+                            *(int*)(s + 0x90) = tex;
+                            *(int*)(s + 0x2390) = g_layers[i].is_multiview ? tex : g_layers[i].textures[1];
+                            *(int*)(s + 0xdabc) = 0;
+                            *(int*)(s + 0xda98) = 0;
+                            *(unsigned char*)(s + 0xd810) = 1;
+                        }
+                    }
+
+                    /* Restore GL state */
+                    void (*realBind2)(GLenum, GLuint) = real_glBindFramebuffer ? real_glBindFramebuffer : glBindFramebuffer;
+                    realBind2(GL_READ_FRAMEBUFFER, savedReadFbo);
+                    realBind2(GL_DRAW_FRAMEBUFFER, savedDrawFbo);
+                    realBind2(GL_FRAMEBUFFER, savedFbo);
+                    glViewport(savedViewport[0], savedViewport[1], savedViewport[2], savedViewport[3]);
                 }
                 if (poll_count == 0) FLOG("Pxr_PollEvent: first frame submitted");
                 poll_count++;
+                /* Set up eye FBO with the eye texture and enable redirect.
+                   When Unity calls glBindFramebuffer(0), it will be redirected
+                   to the eye FBO. Unity's rendering goes to the eye texture. */
+                {
+                    GLuint tex = g_layers[i].textures[0];
+                    if (!g_eye_fbo) glGenFramebuffers(1, &g_eye_fbo);
+                    if (real_glBindFramebuffer) {
+                        real_glBindFramebuffer(GL_FRAMEBUFFER, g_eye_fbo);
+                    } else {
+                        glBindFramebuffer(GL_FRAMEBUFFER, g_eye_fbo);
+                    }
+                    if (g_layers[i].is_multiview && g_glFramebufferTextureMultiview) {
+                        g_glFramebufferTextureMultiview(GL_FRAMEBUFFER,
+                            GL_COLOR_ATTACHMENT0, tex, 0, 0, 2);
+                    } else {
+                        glFramebufferTextureLayer(GL_FRAMEBUFFER,
+                            GL_COLOR_ATTACHMENT0, tex, 0, 0);
+                    }
+                    g_redirect_fbo = 1;
+                    static int redirect_log = 0;
+                    if (redirect_log < 3) {
+                        LOGI("Pxr_PollEvent: eye FBO=%u set up, redirect enabled tex=%u", g_eye_fbo, tex);
+                        redirect_log++;
+                    }
+                }
                 break;
             }
         }
@@ -1692,7 +1985,30 @@ JNIEXPORT int Pxr_PollEvent(void* event) {
 
 /* ---- Missing functions needed by libPxrPlatform.so ---- */
 
-JNIEXPORT int Pxr_Construct() { LOGI("Pxr_Construct -> 0"); return 0; }
+JNIEXPORT int Pxr_Construct() {
+    LOGI("Pxr_Construct called");
+    FLOG("Pxr_Construct called");
+    /* Try calling libPxrPlatform.so's Pxr_Construct to initialize the
+       display subsystem. This is what Unity's XR Management should call
+       but doesn't, so we call it ourselves. */
+    static int (*pplatform_construct)(void) = NULL;
+    if (!pplatform_construct) {
+        void* h = dlopen("libPxrPlatform.so", RTLD_NOW | RTLD_NOLOAD);
+        if (!h) h = dlopen("libPxrPlatform.so", RTLD_NOW);
+        if (h) {
+            pplatform_construct = (int(*)(void))dlsym(h, "Pxr_Construct");
+            LOGI("Pxr_Construct: found libPxrPlatform.so Pxr_Construct=%p", pplatform_construct);
+        } else {
+            LOGI("Pxr_Construct: failed to load libPxrPlatform.so: %s", dlerror());
+        }
+    }
+    if (pplatform_construct) {
+        int ret = pplatform_construct();
+        LOGI("Pxr_Construct: libPxrPlatform.so returned %d", ret);
+        return ret;
+    }
+    return 0;
+}
 JNIEXPORT int Pxr_LoadPlugin(const char* name) { LOGI("Pxr_LoadPlugin(%s) -> 0", name ? name : "null"); return 0; }
 JNIEXPORT int Pxr_UnloadPlugin() { LOGI("Pxr_UnloadPlugin -> 0"); return 0; }
 JNIEXPORT int Pxr_GetFocusState() { return 1; }
@@ -1950,14 +2266,57 @@ JNIEXPORT void glFramebufferTexturesampleMultiview(GLenum target, GLenum attachm
     }
 }
 
+/* Wrapped render event function - intercepts GL.IssuePluginEvent calls
+   to copy the default framebuffer to the eye texture before TimeWarp. */
+static void wrapped_RenderEvent(int event) {
+    static int event_log_count = 0;
+    FLOGI("wrapped_RenderEvent: event=", event);
+    if (event_log_count < 50) {
+        LOGI("wrapped_RenderEvent: event=%d g_render_thread_inited=%d", event, g_render_thread_inited);
+        event_log_count++;
+    }
+    /* Set texture IDs in the up struct before calling PVR render events.
+       From Ghidra decompilation of UnityRenderEvent_:
+       - 0x40c (BOTH_EYE): reads up+0xf960 + up+0xf964, calls PVR_CameraEndFrame
+         which writes up+0x4c (left) and up+0x50 (right)
+       - 0x405 (TIMEWARP): reads up+0xf928 + up+0xf92c, calls PVR_TimeWarpEvent
+         which checks up+0x4c!=0, copies to up+0x90, calls pvr_WarpSwap
+       - up+0x68 must be non-zero for CameraEndFrame to write */
+    if (g_render_thread_inited) {
+        char* s = (char*)dlsym(pvr.handle, "up");
+        if (s) {
+            for (int i = 0; i < MAX_LAYERS; i++) {
+                if (g_layers[i].in_use) {
+                    GLuint tex = g_layers[i].textures[0];
+                    /* up+0x68: enable CameraEndFrame to write up+0x4c/0x50 */
+                    *(unsigned char*)(s + 0x68) = 1;
+                    /* up+0xf960: texture ID for BOTH_EYE_END_FRAME
+                       (passed to PVR_CameraEndFrame which writes up+0x4c) */
+                    *(int*)(s + 0xf960) = tex;
+                    *(int*)(s + 0xf964) = 0;
+                    /* up+0xf928: frame index for TIMEWARP (must be <= 63!)
+                       NOT a texture ID - PVR_TimeWarpEvent_ skips if > 0x3f */
+                    *(int*)(s + 0xf928) = 0;
+                    *(int*)(s + 0xf92c) = 0;
+                    /* up+0xd810: enable eyebuffer path in TimeWarp */
+                    *(unsigned char*)(s + 0xd810) = 1;
+                    *(int*)(s + 0xdabc) = 0;
+                    break;
+                }
+            }
+        }
+    }
+    if (pvr_real_RenderEvent) pvr_real_RenderEvent(event);
+}
+
 JNIEXPORT void* GetRenderEventFunc() {
-    /* Return PVR's UnityRenderEvent so Unity can call it for TimeWarp */
-    if (pvr.RenderEvent) return (void*)pvr.RenderEvent;
+    /* Return our wrapper so we can intercept events and copy framebuffer */
+    if (pvr.RenderEvent) return (void*)wrapped_RenderEvent;
     return NULL;
 }
 
 JNIEXPORT void OnRenderEvent(int event) {
-    if (pvr.RenderEvent) pvr.RenderEvent(event);
+    wrapped_RenderEvent(event);
 }
 
 /* ---- JNI functions (called from Java pxr_api classes) ---- */

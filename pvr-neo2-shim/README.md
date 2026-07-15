@@ -1,43 +1,37 @@
 # pvr-neo2-shim
 
-Compatibility shim that lets PicoXR Platform-based Pico Neo 3 games render on a Pico Neo 2.
+Compatibility shim that lets PicoXR Platform (PXR) based Pico Neo 3 games run on a Pico Neo 2 headset.
 
-Audio and controllers already work on Neo 2 because they go through legacy services that are still present. The display does not work because the XR Platform runtime path expects a PicoXR OpenXR runtime that Neo 2 does not provide. This shim sits in the middle: it keeps the original `libPvr_UnitySDK.so` for sensor/controller/audio logic and intercepts the display-related calls to apply Neo 2-compatible parameters.
+The Neo 2 ships with the older PVR Unity SDK runtime, not the PXR Platform / OpenXR runtime that Neo 3 games expect. This shim translates PXR Platform API calls to the PVR runtime calls that Neo 2 provides, so the game loads and renders without needing the actual PXR runtime.
 
 ## How it works
 
-1. The C patcher (`src/patcher/`) reads the input APK, checks for `lib/arm64-v8a/libPvr_UnitySDK.so`, and extracts it.
-2. It parses the ELF export table to find all `Pvr_`/`PVR_`/`Java_`/`JNI_` functions.
-3. It generates arm64 assembly trampolines and a C++ resolver table for every exported function.
-4. It builds the shim `.so` with the Android NDK.
-5. `src/hooks.cpp` overrides the subset of functions that affect display initialization (`Pvr_Init`, `Pvr_ChangeScreenParameters`, `Pvr_SetInitActivity`, `Pvr_SetCurrentHMDType`, etc.).
-6. `src/loader.cpp` loads the renamed original `libPvr_UnitySDK_orig.so` and resolves all function pointers at load time.
-7. The patcher decodes the APK with apktool, swaps the library, fixes the manifest, rebuilds, and re-signs.
+1. The C patcher (`src/patcher/`) reads the input APK and checks for `lib/arm64-v8a/libpxr_api.so` (PXR Platform) or `libPvr_UnitySDK.so` (PVR SDK).
+2. For PXR Platform games, it injects `libpxr_api.so` — our shim that implements all PXR Platform exports by forwarding to the PVR runtime (`libPvr_UnitySDK_compat.so`).
+3. The shim loads the PVR compat library via `dlopen`, resolves all PVR functions via `dlsym`, and translates calls at runtime.
+4. Key translations:
+   - `Pxr_Initialize` → loads PVR runtime, inits sensor
+   - `Pxr_CreateLayer` → creates PVR eye textures, sets up layer data
+   - `Pxr_PollEvent` → polls PVR sensor state, submits frames to TimeWarp
+   - `Pxr_GetMainSensorState` → wraps PVR sensor state with Neo 2 eye poses
+   - `Pxr_GetControllerState*` → wraps PVR controller state
+5. The patcher decodes the APK with apktool, injects the shim, fixes the manifest, rebuilds, and re-signs.
 
 ## Project layout
 
 ```
 pvr-neo2-shim/
   CMakeLists.txt          # shim .so build (cross-compiled for arm64)
-  build.sh                # builds both the patcher and (optionally) the shim
+  build.sh                # builds both the patcher and the shim
   README.md
   src/
-    loader.cpp / loader.h
-    hooks.cpp / hooks.h
-    log.h
-    generated/            # populated by the patcher or generate_forward_stubs.py
-      forward_stubs.S
-      forward_vars.cpp
+    pxr_api_shim.c        # main shim implementation (~2400 lines)
+    java/                 # Java helpers (VrActivity for PVR init)
     patcher/              # host-side C patcher tool
       main.c
-      apk_check.c / .h    # ZIP reading, compatibility check
-      elf_symbols.c / .h  # ELF export table parsing
-      stub_gen.c / .h     # assembly + C++ stub generation
+      apk_check.c / .h
       CMakeLists.txt
-  tools/                  # legacy Python tools (still work, patcher replaces them)
-    extract_pvr_functions.py
-    generate_forward_stubs.py
-    patch_apk.py
+  prebuilt/               # prebuilt PVR runtime libs for Neo 2
   docs/
     design.md
 ```
@@ -49,7 +43,7 @@ cd pvr-neo2-shim
 ./build.sh
 ```
 
-This builds the C patcher. To also pre-build the shim for a specific APK, pass it as an argument: `./build.sh game.apk`.
+This builds the C patcher and the shim library. The NDK must be installed (default path: `/opt/android-sdk/ndk/27.0.12077973`).
 
 ## Patch a game
 
@@ -58,11 +52,10 @@ src/patcher/build/pvr-patcher <input.apk> [output.apk]
 ```
 
 The patcher will:
-1. Check that the APK has `lib/arm64-v8a/libPvr_UnitySDK.so` (compatibility check)
-2. Extract exported symbols from the original `.so`
-3. Generate and build the shim
-4. Decode the APK, swap the library, fix the manifest
-5. Rebuild, zipalign, and sign the output
+1. Check that the APK has the expected PXR/PVR native libraries
+2. Build the shim `.so` for arm64
+3. Decode the APK, inject the shim, fix the manifest
+4. Rebuild, zipalign, and sign the output
 
 If no output path is given, it appends `_neo2.apk` to the input name.
 
@@ -76,18 +69,19 @@ Options:
 
 ## Status
 
-Working on Pico Neo 2. The generic shim has been tested with Warplanes: Battles
-Over Pacific (`pvr.sdk.version=XR Platform_1.2.4.7`) and renders at 72 FPS with
-TimeWarp active. Audio, controllers, and head tracking all function.
+Work in progress. The shim successfully patches and runs Touring Karts (PXR Platform based) on Neo 2. Sensor data, controllers, and audio work. Rendering is being debugged — the PVR TimeWarp is active and processing frames, but getting Unity's rendered output to the eye textures requires correct texture ID passing through the PVR SDK's internal struct.
 
-The shim is generic — no game-specific code or patches. Any PVR SDK-based Neo 3
-game that ships `libPvr_UnitySDK.so` should work without modification.
+### Current rendering approach
+
+The PVR SDK uses a large internal struct (`up`) to pass texture IDs between render events. From Ghidra decompilation of `UnityRenderEvent_`:
+- Event `0x40c` (BOTH_EYE_END_FRAME) reads `up+0xf960` and calls `PVR_CameraEndFrame` which writes `up+0x4c` (left eye tex)
+- Event `0x405` (TIMEWARP) reads `up+0xf928` as a frame index (must be <= 63), then reads `up+0x4c` and copies to `up+0x90` (LE_TexID) before calling `pvr_WarpSwap`
+- `up+0x68` must be set to 1 for `PVR_CameraEndFrame` to write
+
+The shim wraps `UnityRenderEvent` to set these struct fields before each render event call.
 
 ## Next steps
 
-- Test with additional PVR-based Neo 3 titles to verify broad compatibility.
-- Fill in Neo 2-specific screen/lens parameters in `src/hooks.cpp` if any game
-  queries them and gets wrong values.
-- OpenXR-based games (Pico Integration SDK 2.x, `libPxrPlatform.so`) are not
-  supported by this shim. They need a different approach since Neo 2 lacks the
-  OpenXR runtime those games expect.
+- Get Unity's rendered content to appear in the eye textures
+- Test with additional PXR Platform based Neo 3 titles
+- Verify 6DoF tracking works correctly with the shimmed sensor state

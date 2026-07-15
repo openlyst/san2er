@@ -1,0 +1,37 @@
+# Build artifacts
+build/
+build_pxr/
+*.o
+*.so
+*.a
+
+# Patched APKs
+*.apk
+!prebuilt/*.apk
+
+# Patcher binary
+src/patcher/build/
+
+# Ghidra projects
+*.gpr
+*.rep/
+ghidra_project/
+
+# Logs
+*.log
+shim_logs.txt
+all_logs.txt
+all_logs_raw.txt
+
+# Temp/work dirs
+.work/
+tmp/
+
+# Prebuilt decompiled output
+prebuilt/classes2_smali/
+prebuilt/classes2_wrap/
+prebuilt/orig_libpxr/
+
+# IDE
+.vscode/
+.idea/
