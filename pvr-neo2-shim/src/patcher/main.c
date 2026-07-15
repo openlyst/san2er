@@ -115,6 +115,185 @@ static int build_shim(const char *shim_src_dir, const char *ndk_path,
     return 0;
 }
 
+/* Patch VerifyTool.smali to bypass PICO entitlement check.
+   The com.pvr.verify service doesn't exist on Neo 2, so the check
+   always fails and blocks the game from entering the XR render loop.
+   We replace bindVerifyService, verifyAPP, and verifyAPPExt with
+   stubs that call the Unity success callbacks directly. */
+static int patch_smali_entitlement(const char *smali_path) {
+    FILE *f = fopen(smali_path, "r");
+    if (!f) return -1;
+    fseek(f, 0, SEEK_END);
+    long fsize = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    char *buf = malloc(fsize + 1);
+    if (!buf) { fclose(f); return -1; }
+    fread(buf, 1, fsize, f);
+    buf[fsize] = 0;
+    fclose(f);
+
+    /* Replace bindVerifyService method */
+    const char *bind_old = ".method public bindVerifyService(Landroid/content/Context;Ljava/lang/String;)Z";
+    char *bind_start = strstr(buf, bind_old);
+    if (bind_start) {
+        char *bind_end = strstr(bind_start, "\n.end method\n");
+        if (bind_end) {
+            bind_end += strlen("\n.end method\n");
+            const char *bind_new =
+                ".method public bindVerifyService(Landroid/content/Context;Ljava/lang/String;)Z\n"
+                "    .locals 2\n\n"
+                "    sput-object p2, Lcom/psmart/aosoperation/VerifyTool;->unityObjectName:Ljava/lang/String;\n\n"
+                "    const-string v0, \"BindVerifyServiceCallback\"\n"
+                "    const-string v1, \"\"\n"
+                "    invoke-static {p2, v0, v1}, Lcom/unity3d/player/UnityPlayer;->UnitySendMessage(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V\n\n"
+                "    const/4 v0, 0x1\n"
+                "    return v0\n"
+                ".end method\n";
+            size_t old_len = bind_end - bind_start;
+            size_t new_len = strlen(bind_new);
+            char *new_buf = malloc(fsize - old_len + new_len + 1);
+            memcpy(new_buf, buf, bind_start - buf);
+            memcpy(new_buf + (bind_start - buf), bind_new, new_len);
+            memcpy(new_buf + (bind_start - buf) + new_len, bind_end, fsize - (bind_end - buf) + 1);
+            free(buf);
+            buf = new_buf;
+            fsize = strlen(buf);
+        }
+    }
+
+    /* Replace verifyAPPExt method */
+    const char *ext_old = ".method public static verifyAPPExt(Landroid/content/Context;Ljava/lang/String;Ljava/lang/String;)I";
+    char *ext_start = strstr(buf, ext_old);
+    if (ext_start) {
+        char *ext_end = strstr(ext_start, "\n.end method\n");
+        if (ext_end) {
+            ext_end += strlen("\n.end method\n");
+            const char *ext_new =
+                ".method public static verifyAPPExt(Landroid/content/Context;Ljava/lang/String;Ljava/lang/String;)I\n"
+                "    .locals 2\n\n"
+                "    sget-object v0, Lcom/psmart/aosoperation/VerifyTool;->unityObjectName:Ljava/lang/String;\n"
+                "    if-eqz v0, :cond_0\n\n"
+                "    const-string v1, \"verifyAPPCallback\"\n"
+                "    const-string p0, \"0\"\n"
+                "    invoke-static {v0, v1, p0}, Lcom/unity3d/player/UnityPlayer;->UnitySendMessage(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V\n\n"
+                "    :cond_0\n"
+                "    const/4 v0, 0x0\n"
+                "    return v0\n"
+                ".end method\n";
+            size_t old_len = ext_end - ext_start;
+            size_t new_len = strlen(ext_new);
+            char *new_buf = malloc(fsize - old_len + new_len + 1);
+            memcpy(new_buf, buf, ext_start - buf);
+            memcpy(new_buf + (ext_start - buf), ext_new, new_len);
+            memcpy(new_buf + (ext_start - buf) + new_len, ext_end, fsize - (ext_end - buf) + 1);
+            free(buf);
+            buf = new_buf;
+            fsize = strlen(buf);
+        }
+    }
+
+    /* Replace verifyAPP method */
+    const char *vap_old = ".method public static verifyAPP(Landroid/content/Context;Ljava/lang/String;Ljava/lang/String;)Z";
+    char *vap_start = strstr(buf, vap_old);
+    if (vap_start) {
+        char *vap_end = strstr(vap_start, "\n.end method\n");
+        if (vap_end) {
+            vap_end += strlen("\n.end method\n");
+            const char *vap_new =
+                ".method public static verifyAPP(Landroid/content/Context;Ljava/lang/String;Ljava/lang/String;)Z\n"
+                "    .locals 2\n\n"
+                "    sget-object v0, Lcom/psmart/aosoperation/VerifyTool;->unityObjectName:Ljava/lang/String;\n"
+                "    if-eqz v0, :cond_0\n\n"
+                "    const-string v1, \"verifyAPPCallback\"\n"
+                "    const-string p0, \"0\"\n"
+                "    invoke-static {v0, v1, p0}, Lcom/unity3d/player/UnityPlayer;->UnitySendMessage(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V\n\n"
+                "    :cond_0\n"
+                "    const/4 v0, 0x1\n"
+                "    return v0\n"
+                ".end method\n";
+            size_t old_len = vap_end - vap_start;
+            size_t new_len = strlen(vap_new);
+            char *new_buf = malloc(fsize - old_len + new_len + 1);
+            memcpy(new_buf, buf, vap_start - buf);
+            memcpy(new_buf + (vap_start - buf), vap_new, new_len);
+            memcpy(new_buf + (vap_start - buf) + new_len, vap_end, fsize - (vap_end - buf) + 1);
+            free(buf);
+            buf = new_buf;
+        }
+    }
+
+    f = fopen(smali_path, "w");
+    if (!f) { perror("fopen VerifyTool smali w"); free(buf); return -1; }
+    fputs(buf, f);
+    fclose(f);
+    free(buf);
+    printf("[smali] patched VerifyTool to bypass entitlement check\n");
+    return 0;
+}
+
+static int patch_smali_vrshell(const char *smali_path) {
+    FILE *f = fopen(smali_path, "r");
+    if (!f) return -1;
+
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+
+    char *buf = malloc(sz + 1);
+    if (!buf) { fclose(f); return -1; }
+    fread(buf, 1, sz, f);
+    buf[sz] = '\0';
+    fclose(f);
+
+    /* Replace the isVRShellDisplayExist method body with "return false" */
+    const char *method_sig = ".method public static isVRShellDisplayExist(Landroid/hardware/display/DisplayManager;)Z";
+    char *method_start = strstr(buf, method_sig);
+    if (!method_start) {
+        free(buf);
+        return -1;
+    }
+
+    /* Find the end of the method (.end method) */
+    char *method_end = strstr(method_start, ".end method");
+    if (!method_end) {
+        free(buf);
+        return -1;
+    }
+    method_end += strlen(".end method");
+
+    /* Build replacement method */
+    char replacement[512];
+    snprintf(replacement, sizeof(replacement),
+        "%s\n"
+        "    .locals 1\n\n"
+        "    const/4 v0, 0x0\n\n"
+        "    return v0\n"
+        "%s",
+        method_sig, ".end method");
+
+    /* Replace the method */
+    size_t prefix_len = method_start - buf;
+    size_t suffix_len = strlen(method_end);
+    size_t repl_len = strlen(replacement);
+    char *new_buf = malloc(prefix_len + repl_len + suffix_len + 1);
+    if (!new_buf) { free(buf); return -1; }
+
+    memcpy(new_buf, buf, prefix_len);
+    memcpy(new_buf + prefix_len, replacement, repl_len);
+    memcpy(new_buf + prefix_len + repl_len, method_end, suffix_len);
+    new_buf[prefix_len + repl_len + suffix_len] = '\0';
+
+    f = fopen(smali_path, "w");
+    if (!f) { perror("fopen smali w"); free(buf); free(new_buf); return -1; }
+    fputs(new_buf, f);
+    fclose(f);
+
+    free(buf);
+    free(new_buf);
+    printf("[smali] patched isVRShellDisplayExist to return false\n");
+    return 0;
+}
+
 static int patch_manifest(const char *manifest_path) {
     FILE *f = fopen(manifest_path, "r");
     if (!f) {
@@ -149,14 +328,42 @@ static int patch_manifest(const char *manifest_path) {
         }
     }
 
-    char *is = strstr(buf, "com.pvr.instructionset");
-    if (is) {
-        char *val = strstr(is, "android:value=\"32\"");
+    /* The Neo 2 PVR Shell looks for "pvr.app.type" to determine if an app
+       is a VR app. Neo 3 games use "com.picovr.type" instead. We need to
+       add the Neo 2 metadata so the PVR Shell doesn't switch back to home. */
+    const char *neo2_meta =
+        "    <meta-data android:name=\"pvr.app.type\" android:value=\"vr\" />\n"
+        "    <meta-data android:name=\"pvr.display.orientation\" android:value=\"180\" />\n"
+        "    <meta-data android:name=\"com.pvr.hmd.trackingmode\" android:value=\"6dof\" />\n"
+        "    <meta-data android:name=\"com.pvr.instructionset\" android:value=\"32\" />\n"
+        "    <meta-data android:name=\"enable_entitlementcheck\" android:value=\"0\" />\n"
+        "    <meta-data android:name=\"isPUI\" android:value=\"0\" />\n"
+        "    <meta-data android:name=\"platform_logo\" android:value=\"0\" />\n";
+
+    if (!strstr(buf, "pvr.app.type")) {
+        char *app_tag = strstr(buf, "<application");
+        if (app_tag) {
+            char *tag_end = strchr(app_tag, '>');
+            if (tag_end) {
+                tag_end++;
+                size_t mlen = strlen(neo2_meta);
+                size_t blen = strlen(buf);
+                memmove(tag_end + mlen, tag_end, blen - (tag_end - buf) + 1);
+                memcpy(tag_end, neo2_meta, mlen);
+                changed = 1;
+                printf("[manifest] added Neo 2 PVR metadata (pvr.app.type, trackingmode, instructionset)\n");
+            }
+        }
+    }
+
+    /* Disable entitlement check for Neo 2 */
+    char *ec = strstr(buf, "enable_entitlementcheck");
+    if (ec) {
+        char *val = strstr(ec, "android:value=\"1\"");
         if (val) {
-            val[strlen("android:value=\"")] = '6';
-            val[strlen("android:value=\"6")] = '4';
+            val[strlen("android:value=\"")] = '0';
             changed = 1;
-            printf("[manifest] changed com.pvr.instructionset from 32 to 64\n");
+            printf("[manifest] disabled entitlement check\n");
         }
     }
 
@@ -427,6 +634,35 @@ int main(int argc, char **argv) {
     char manifest_path[1024];
     snprintf(manifest_path, sizeof(manifest_path), "%s/AndroidManifest.xml", decoded_dir);
     patch_manifest(manifest_path);
+
+    /* Patch smali to prevent PVR Shell from stealing focus.
+       The game's UnityPlayerNativeActivityPico calls VRDataUtils.setTopApp()
+       when isVRShellDisplayExist() returns true, which triggers the system's
+       PVRShell code to switch to the VR display (display 2). Since our game
+       isn't on display 2, it loses focus to com.pvr.home. By making
+       isVRShellDisplayExist() return false, the game stays on display 0
+       and our shim handles VR rendering. */
+    char smali_path[1024];
+    const char *smali_dirs[] = { "smali", "smali_classes2", "smali_classes3", NULL };
+    int smali_patched = 0;
+    for (int i = 0; smali_dirs[i] && !smali_patched; i++) {
+        snprintf(smali_path, sizeof(smali_path),
+            "%s/%s/com/psmart/vrlib/VRDataUtils.smali", decoded_dir, smali_dirs[i]);
+        if (patch_smali_vrshell(smali_path) == 0)
+            smali_patched = 1;
+    }
+    if (!smali_patched)
+        fprintf(stderr, "warning: VRDataUtils.smali not found, skipping smali patch\n");
+
+    /* Patch VerifyTool.smali to bypass PICO entitlement check.
+       The com.pvr.verify service doesn't exist on Neo 2, causing the
+       entitlement check to fail and block the XR render loop. */
+    for (int i = 0; smali_dirs[i]; i++) {
+        snprintf(smali_path, sizeof(smali_path),
+            "%s/%s/com/psmart/aosoperation/VerifyTool.smali", decoded_dir, smali_dirs[i]);
+        if (patch_smali_entitlement(smali_path) == 0)
+            break;
+    }
 
     if (apk_type == APK_TYPE_PVR_SDK) {
         inject_shim_pvr(decoded_dir, shim_out);

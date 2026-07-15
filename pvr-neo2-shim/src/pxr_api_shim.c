@@ -13,6 +13,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <math.h>
+#include <stdint.h>
 #include <android/log.h>
 #include <EGL/egl.h>
 #include <GLES3/gl3.h>
@@ -636,6 +637,7 @@ JNIEXPORT int Pxr_CreateLayer(void* layerParamPtr) {
         LOGI("initializing PVR render thread from Pxr_CreateLayer");
         pvr.RenderEvent(RENDER_EVENT_INIT_RENDER_THREAD);
         g_render_thread_inited = 1;
+        LOGI("PVR render thread init returned");
     }
 
     if (pvr.SetupLayerData && pvr.RenderEvent) {
@@ -648,6 +650,7 @@ JNIEXPORT int Pxr_CreateLayer(void* layerParamPtr) {
         LOGI("submitted first frame to PVR TimeWarp");
     }
 
+    LOGI("Pxr_CreateLayer returning slot %d", slot);
     return slot;
 }
 
@@ -1004,6 +1007,35 @@ JNIEXPORT int Pxr_SetExtraLatencyMode(int mode) { return 0; }
 JNIEXPORT int Pxr_GetAppHasFocus() { LOGI("Pxr_GetAppHasFocus -> 1"); return 1; }
 JNIEXPORT int Pxr_GetTrackingState() { LOGI("Pxr_GetTrackingState -> 1"); return 1; }
 JNIEXPORT int Pxr_PollEvent(void* event) { return 0; }
+
+/* ---- Missing functions needed by libPxrPlatform.so ---- */
+
+JNIEXPORT int Pxr_Construct() { LOGI("Pxr_Construct -> 0"); return 0; }
+JNIEXPORT int Pxr_LoadPlugin(const char* name) { LOGI("Pxr_LoadPlugin(%s) -> 0", name ? name : "null"); return 0; }
+JNIEXPORT int Pxr_UnloadPlugin() { LOGI("Pxr_UnloadPlugin -> 0"); return 0; }
+JNIEXPORT int Pxr_GetFocusState() { return 1; }
+JNIEXPORT int Pxr_IsSensorReady() { return 1; }
+JNIEXPORT int Pxr_GetSensorStatus() { return 1; }
+JNIEXPORT int Pxr_GetSeeThroughState() { return 0; }
+JNIEXPORT int Pxr_GetMRCEnable() { return 0; }
+JNIEXPORT int Pxr_GetHomeKey() { return 0; }
+JNIEXPORT int Pxr_InitHomeKey() { return 0; }
+JNIEXPORT int Pxr_SetFoveationLevelEnable(int enable) { return 0; }
+JNIEXPORT int Pxr_SetInputDeviceChangedCallBack(void* cb) { return 0; }
+JNIEXPORT int Pxr_SetLayerBlend(int layerId, float alpha) { return 0; }
+JNIEXPORT int Pxr_SetLogInfoActive(int active, int level) { return 0; }
+JNIEXPORT int Pxr_SetSRPState(int state) { return 0; }
+JNIEXPORT int Pxr_SetUserDefinedSettings(void* settings) { return 0; }
+JNIEXPORT int Pxr_SetVideoSeethroughState(int state) { return 0; }
+JNIEXPORT int Pxr_CreateLayerParam(void* param) { return 0; }
+JNIEXPORT int Pxr_EnableEyeTracking(int enable) { return 0; }
+JNIEXPORT int Pxr_EnableFaceTracking(int enable) { return 0; }
+JNIEXPORT int Pxr_EnableLipsync(int enable) { return 0; }
+JNIEXPORT void* Pxr_GetLayerImagePtr(int layerId, int eye, int imageIndex) {
+    if (layerId < 0 || layerId >= MAX_LAYERS || !g_layers[layerId].in_use)
+        return NULL;
+    return (void*)(uintptr_t)g_layers[layerId].textures[imageIndex % SWAPCHAIN_LEN];
+}
 
 /* ---- Multiview ---- */
 
