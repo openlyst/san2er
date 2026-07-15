@@ -101,20 +101,6 @@ static struct {
 
 /* ---- State ---- */
 
-static JavaVM* g_jvm = NULL;
-static int g_initialized = 0;
-static int g_init_requested = 0;
-static int g_xr_running = 0;
-static int g_render_thread_inited = 0;
-static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
-
-/* GL multiview extension function pointers */
-typedef void (*PFNGLFRAMEBUFFERTEXTUREMULTIVIEWOVRPROC)(GLenum, GLenum, GLuint, GLint, GLint, GLsizei);
-typedef void (*PFNGLFRAMEBUFFERTEXTURESAMPLEMULTIVIEWOVRPROC)(GLenum, GLenum, GLuint, GLint, GLint, GLsizei);
-static PFNGLFRAMEBUFFERTEXTUREMULTIVIEWOVRPROC g_glFramebufferTextureMultiview = NULL;
-static PFNGLFRAMEBUFFERTEXTURESAMPLEMULTIVIEWOVRPROC g_glFramebufferTextureSampleMultiview = NULL;
-
-/* Layer/swapchain state */
 #define MAX_LAYERS 8
 #define SWAPCHAIN_LEN 2
 
@@ -129,6 +115,156 @@ struct layer_info {
 };
 
 static struct layer_info g_layers[MAX_LAYERS];
+
+static JavaVM* g_jvm = NULL;
+static int g_initialized = 0;
+static int g_init_requested = 0;
+static int g_xr_running = 0;
+static int g_render_thread_inited = 0;
+static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* ---- eglSwapBuffers hook via GOT patching ---- */
+static EGLBoolean (*real_eglSwapBuffers)(EGLDisplay, EGLSurface) = NULL;
+static unsigned char* g_swap_pixels = NULL;
+static int g_swap_pix_w = 0, g_swap_pix_h = 0;
+static int g_swap_hook_installed = 0;
+
+static EGLBoolean hook_eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
+    if (g_render_thread_inited && real_eglSwapBuffers) {
+        for (int i = 0; i < MAX_LAYERS; i++) {
+            if (g_layers[i].in_use) {
+                int w = g_layers[i].width;
+                int h = g_layers[i].height;
+                GLuint tex = g_layers[i].textures[0];
+                if (!g_swap_pixels || g_swap_pix_w != w || g_swap_pix_h != h) {
+                    free(g_swap_pixels);
+                    g_swap_pixels = (unsigned char*)malloc(w * h * 4);
+                    g_swap_pix_w = w;
+                    g_swap_pix_h = h;
+                }
+                GLint prevFbo = 0;
+                glGetIntegerv(GL_FRAMEBUFFER_BINDING, &prevFbo);
+                glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+                glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, g_swap_pixels);
+                glBindFramebuffer(GL_FRAMEBUFFER, prevFbo);
+                glBindTexture(GL_TEXTURE_2D_ARRAY, tex);
+                glTexSubImage3D(GL_TEXTURE_2D_ARRAY, 0, 0, 0, 0, w, h, 1,
+                                GL_RGBA, GL_UNSIGNED_BYTE, g_swap_pixels);
+                glTexSubImage3D(GL_TEXTURE_2D_ARRAY, 0, 0, 0, 1, w, h, 1,
+                                GL_RGBA, GL_UNSIGNED_BYTE, g_swap_pixels);
+                glBindTexture(GL_TEXTURE_2D_ARRAY, 0);
+                break;
+            }
+        }
+    }
+    return real_eglSwapBuffers(dpy, surface);
+}
+
+#include <link.h>
+#include <sys/mman.h>
+#include <elf.h>
+
+static int patch_eglSwapBuffers_got(struct dl_phdr_info* info, size_t size, void* data) {
+    const char* name = info->dlpi_name;
+    if (!name) return 0;
+    /* Only patch libunity.so */
+    if (!strstr(name, "libunity.so")) return 0;
+
+    LOGI("patch_eglSwapBuffers: found %s at %p", name, (void*)info->dlpi_addr);
+
+    Elf64_Sym* symtab = NULL;
+    const char* strtab = NULL;
+    Elf64_Rel* rel = NULL;
+    size_t relsz = 0, relent = 0;
+    Elf64_Rela* rela = NULL;
+    size_t relasz = 0, relaent = 0;
+
+    for (int i = 0; i < info->dlpi_phnum; i++) {
+        const Elf64_Phdr* phdr = &info->dlpi_phdr[i];
+        if (phdr->p_type == PT_DYNAMIC) {
+            Elf64_Dyn* dyn = (Elf64_Dyn*)(info->dlpi_addr + phdr->p_vaddr);
+            for (Elf64_Dyn* d = dyn; d->d_tag != DT_NULL; d++) {
+                switch (d->d_tag) {
+                case DT_SYMTAB: symtab = (Elf64_Sym*)(info->dlpi_addr + d->d_un.d_ptr); break;
+                case DT_STRTAB: strtab = (const char*)(info->dlpi_addr + d->d_un.d_ptr); break;
+                case DT_JMPREL: rel = (Elf64_Rel*)(info->dlpi_addr + d->d_un.d_ptr); break;
+                case DT_PLTRELSZ: relsz = d->d_un.d_val; break;
+                case DT_RELA: rela = (Elf64_Rela*)(info->dlpi_addr + d->d_un.d_ptr); break;
+                case DT_RELASZ: relasz = d->d_un.d_val; break;
+                case DT_RELAENT: relaent = d->d_un.d_val; break;
+                case DT_RELENT: relent = d->d_un.d_val; break;
+                }
+            }
+            break;
+        }
+    }
+
+    LOGI("patch_eglSwapBuffers: symtab=%p strtab=%p rel=%p relsz=%zu rela=%p relasz=%zu",
+         symtab, strtab, rel, relsz, rela, relasz);
+
+    if (!symtab || !strtab) return 0;
+
+    /* Search JMPREL (PLT relocations) for eglSwapBuffers */
+    if (rel && relsz > 0) {
+        size_t ent = relent ? relent : sizeof(Elf64_Rel);
+        int count = relsz / ent;
+        LOGI("patch_eglSwapBuffers: JMPREL count=%d ent=%zu", count, ent);
+        for (int j = 0; j < count; j++) {
+            Elf64_Rel* r = (Elf64_Rel*)((char*)rel + j * ent);
+            int symidx = ELF64_R_SYM(r->r_info);
+            Elf64_Sym* sym = &symtab[symidx];
+            const char* symname = strtab + sym->st_name;
+            if (symname && strcmp(symname, "eglSwapBuffers") == 0) {
+                void** got_entry = (void**)(info->dlpi_addr + r->r_offset);
+                uintptr_t page = (uintptr_t)got_entry & ~0xFFF;
+                mprotect((void*)page, 0x1000, PROT_READ | PROT_WRITE);
+                real_eglSwapBuffers = (EGLBoolean (*)(EGLDisplay, EGLSurface))*got_entry;
+                *got_entry = (void*)hook_eglSwapBuffers;
+                LOGI("Hooked eglSwapBuffers in %s (GOT %p -> %p)", name, got_entry, hook_eglSwapBuffers);
+                g_swap_hook_installed = 1;
+                return 1;
+            }
+        }
+    }
+    /* Search RELA */
+    if (rela && relasz > 0) {
+        size_t ent = relaent ? relaent : sizeof(Elf64_Rela);
+        int count = relasz / ent;
+        LOGI("patch_eglSwapBuffers: RELA count=%d ent=%zu", count, ent);
+        for (int j = 0; j < count; j++) {
+            Elf64_Rela* r = (Elf64_Rela*)((char*)rela + j * ent);
+            int symidx = ELF64_R_SYM(r->r_info);
+            Elf64_Sym* sym = &symtab[symidx];
+            const char* symname = strtab + sym->st_name;
+            if (symname && strcmp(symname, "eglSwapBuffers") == 0) {
+                void** got_entry = (void**)(info->dlpi_addr + r->r_offset);
+                uintptr_t page = (uintptr_t)got_entry & ~0xFFF;
+                mprotect((void*)page, 0x1000, PROT_READ | PROT_WRITE);
+                real_eglSwapBuffers = (EGLBoolean (*)(EGLDisplay, EGLSurface))*got_entry;
+                *got_entry = (void*)hook_eglSwapBuffers;
+                LOGI("Hooked eglSwapBuffers in %s (RELA GOT %p)", name, got_entry);
+                g_swap_hook_installed = 1;
+                return 1;
+            }
+        }
+    }
+    LOGI("patch_eglSwapBuffers: eglSwapBuffers not found in relocations");
+    return 0;
+}
+
+static void install_swap_hook() {
+    if (g_swap_hook_installed) return;
+    dl_iterate_phdr(patch_eglSwapBuffers_got, NULL);
+}
+
+/* GL multiview extension function pointers */
+typedef void (*PFNGLFRAMEBUFFERTEXTUREMULTIVIEWOVRPROC)(GLenum, GLenum, GLuint, GLint, GLint, GLsizei);
+typedef void (*PFNGLFRAMEBUFFERTEXTURESAMPLEMULTIVIEWOVRPROC)(GLenum, GLenum, GLuint, GLint, GLint, GLsizei);
+static PFNGLFRAMEBUFFERTEXTUREMULTIVIEWOVRPROC g_glFramebufferTextureMultiview = NULL;
+static PFNGLFRAMEBUFFERTEXTURESAMPLEMULTIVIEWOVRPROC g_glFramebufferTextureSampleMultiview = NULL;
+
+/* Layer/swapchain state (definitions moved to top of file) */
+
 static int g_keep_submitting = 0;
 static pthread_t g_submit_thread;
 
@@ -773,6 +909,7 @@ JNIEXPORT int Pxr_CreateLayer(void* layerParamPtr) {
         pvr.RenderEvent(RENDER_EVENT_INIT_RENDER_THREAD);
         g_render_thread_inited = 1;
         LOGI("PVR render thread init returned");
+        install_swap_hook();
     }
     FLOG("Pxr_CreateLayer step 11: render thread done");
 
@@ -1543,27 +1680,6 @@ JNIEXPORT int Pxr_PollEvent(void* event) {
                         }
                     }
                     pvr.RenderEvent(RENDER_EVENT_TIMEWARP);
-                }
-                /* Bind the eye texture as the current framebuffer so Unity
-                   renders to it directly. The game's XR display subsystem
-                   never starts, so Unity would otherwise render to the
-                   screen. By binding the eye texture FBO here (after frame
-                   submission, before returning to Unity), Unity's cameras
-                   will render to the eye texture for this frame. */
-                {
-                    static GLuint eye_fbo = 0;
-                    if (!eye_fbo) glGenFramebuffers(1, &eye_fbo);
-                    glBindFramebuffer(GL_FRAMEBUFFER, eye_fbo);
-                    if (g_layers[i].is_multiview) {
-                        if (g_glFramebufferTextureMultiview) {
-                            g_glFramebufferTextureMultiview(GL_FRAMEBUFFER,
-                                GL_COLOR_ATTACHMENT0, tex, 0, 0, 2);
-                        }
-                    } else {
-                        glFramebufferTextureLayer(GL_FRAMEBUFFER,
-                            GL_COLOR_ATTACHMENT0, tex, 0, 0);
-                    }
-                    glViewport(0, 0, g_layers[i].width, g_layers[i].height);
                 }
                 if (poll_count == 0) FLOG("Pxr_PollEvent: first frame submitted");
                 poll_count++;
