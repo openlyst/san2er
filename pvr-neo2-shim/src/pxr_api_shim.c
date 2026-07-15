@@ -776,6 +776,92 @@ JNIEXPORT int Pxr_CreateLayer(void* layerParamPtr) {
     }
     FLOG("Pxr_CreateLayer step 11: render thread done");
 
+    /* Set up the display surface for TimeWarp. The PVR SDK needs an
+       EGL window surface to present warped frames to the headset.
+       Get the ANativeWindow from the Activity's ViewRootImpl.mSurface
+       and call initialize() to create the EGL surface. */
+    if (g_render_thread_inited) {
+        typedef void (*initialize_t)(void*);
+        initialize_t init_fn = (initialize_t)dlsym(pvr.handle, "_Z10initializeP13ANativeWindow");
+        if (init_fn) {
+            JNIEnv* env = get_env();
+            if (env) {
+                /* Get the current Activity via ActivityThread */
+                jclass at_cls = (*env)->FindClass(env, "android/app/ActivityThread");
+                if (at_cls) {
+                    jmethodID cat = (*env)->GetStaticMethodID(env, at_cls,
+                        "currentActivityThread", "()Landroid/app/ActivityThread;");
+                    jobject at_obj = (*env)->CallStaticObjectMethod(env, at_cls, cat);
+                    if (at_obj) {
+                        jfieldID mf = (*env)->GetFieldID(env, at_cls,
+                            "mActivities", "Landroid/util/ArrayMap;");
+                        if (mf) {
+                            jobject map = (*env)->GetObjectField(env, at_obj, mf);
+                            if (map) {
+                                jclass map_cls = (*env)->GetObjectClass(env, map);
+                                jmethodID size_m = (*env)->GetMethodID(env, map_cls, "size", "()I");
+                                jmethodID val_m = (*env)->GetMethodID(env, map_cls, "valueAt", "(I)Ljava/lang/Object;");
+                                int n = (*env)->CallIntMethod(env, map, size_m);
+                                if (n > 0) {
+                                    jobject record = (*env)->CallObjectMethod(env, map, val_m, 0);
+                                    if (record) {
+                                        jclass rec_cls = (*env)->GetObjectClass(env, record);
+                                        jfieldID act_f = (*env)->GetFieldID(env, rec_cls,
+                                            "activity", "Landroid/app/Activity;");
+                                        if (act_f) {
+                                            jobject activity = (*env)->GetObjectField(env, record, act_f);
+                                            if (activity) {
+                                                /* Activity -> getWindow() -> getDecorView()
+                                                   -> getViewRootImpl() -> mSurface */
+                                                jclass act_cls = (*env)->GetObjectClass(env, activity);
+                                                jmethodID gw = (*env)->GetMethodID(env, act_cls,
+                                                    "getWindow", "()Landroid/view/Window;");
+                                                jobject window = (*env)->CallObjectMethod(env, activity, gw);
+                                                if (window) {
+                                                    jclass win_cls = (*env)->GetObjectClass(env, window);
+                                                    jmethodID gdv = (*env)->GetMethodID(env, win_cls,
+                                                        "getDecorView", "()Landroid/view/View;");
+                                                    jobject decor = (*env)->CallObjectMethod(env, window, gdv);
+                                                    if (decor) {
+                                                        jclass view_cls = (*env)->GetObjectClass(env, decor);
+                                                        jmethodID gvr = (*env)->GetMethodID(env, view_cls,
+                                                            "getViewRootImpl", "()Landroid/view/ViewRootImpl;");
+                                                        jobject vroot = (*env)->CallObjectMethod(env, decor, gvr);
+                                                        if (vroot) {
+                                                            jclass vr_cls = (*env)->GetObjectClass(env, vroot);
+                                                            jfieldID sf = (*env)->GetFieldID(env, vr_cls,
+                                                                "mSurface", "Landroid/view/Surface;");
+                                                            if (sf) {
+                                                                jobject surface = (*env)->GetObjectField(env, vroot, sf);
+                                                                if (surface) {
+                                                                    void* (*ANW_fromSurface)(JNIEnv*, jobject) =
+                                                                        (void*(*)(JNIEnv*, jobject))
+                                                                        dlsym(RTLD_DEFAULT, "ANativeWindow_fromSurface");
+                                                                    if (ANW_fromSurface) {
+                                                                        void* anw = ANW_fromSurface(env, surface);
+                                                                        FLOGI("Pxr_CreateLayer: ANativeWindow=", (int)(uintptr_t)anw);
+                                                                        if (anw) {
+                                                                            init_fn(anw);
+                                                                            FLOG("Pxr_CreateLayer: initialize() called");
+                                                                        }
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     if (pvr.SetupLayerData && pvr.RenderEvent) {
         float colorScaleOffset[8] = {1, 1, 1, 1, 0, 0, 0, 0};
         GLuint tex = g_layers[slot].textures[0];
@@ -900,7 +986,33 @@ JNIEXPORT int Pxr_CreateLayer(void* layerParamPtr) {
         /* Submit frame via UnityRenderEvent_ (bypasses message queue).
            Call BOTH_EYE_END_FRAME to set eye textures, then TIMEWARP. */
         if (pvr.RenderEvent) {
+            /* Check overlay flag before rendering */
+            {
+                char* evbuf = (char*)dlsym(pvr.handle, "eventBuffer");
+                if (evbuf) {
+                    char** got_entry = (char**)(evbuf - 0x15F00);
+                    char* s = *got_entry;
+                    if (s) {
+                        FLOGI("Pxr_CreateLayer: pre-render dabc=", *(int*)(s + 0xdabc));
+                    }
+                }
+            }
             pvr.RenderEvent(RENDER_EVENT_BOTH_EYE_END_FRAME);
+            /* Check overlay flag after BOTH_EYE */
+            {
+                char* evbuf = (char*)dlsym(pvr.handle, "eventBuffer");
+                if (evbuf) {
+                    char** got_entry = (char**)(evbuf - 0x15F00);
+                    char* s = *got_entry;
+                    if (s) {
+                        FLOGI("Pxr_CreateLayer: post-both-eye dabc=", *(int*)(s + 0xdabc));
+                        /* Force-clear overlay flag right before TIMEWARP */
+                        *(int*)(s + 0xdabc) = 0;
+                        *(unsigned char*)(s + 0xd810) = 1;
+                        FLOGI("Pxr_CreateLayer: post-clear dabc=", *(int*)(s + 0xdabc));
+                    }
+                }
+            }
             pvr.RenderEvent(RENDER_EVENT_TIMEWARP);
             FLOG("Pxr_CreateLayer: RenderEvent BOTH_EYE+TIMEWARP called");
         }
@@ -1367,6 +1479,28 @@ JNIEXPORT int Pxr_PollEvent(void* event) {
                 if (pvr.SetCurrentRenderTexture) {
                     pvr.SetCurrentRenderTexture(tex);
                 }
+                /* Render a test pattern to verify the display pipeline.
+                   This fills the eye texture with a red gradient so we can
+                   see if TimeWarp is actually displaying our texture. */
+                {
+                    static int test_rendered = 0;
+                    if (!test_rendered) {
+                        GLuint fbo = 0;
+                        glGenFramebuffers(1, &fbo);
+                        glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+                        glFramebufferTextureLayer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, tex, 0, 0);
+                        glViewport(0, 0, g_layers[i].width, g_layers[i].height);
+                        glClearColor(1.0f, 0.0f, 0.0f, 1.0f);
+                        glClear(GL_COLOR_BUFFER_BIT);
+                        glFramebufferTextureLayer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, tex, 0, 1);
+                        glClearColor(0.0f, 1.0f, 0.0f, 1.0f);
+                        glClear(GL_COLOR_BUFFER_BIT);
+                        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+                        glDeleteFramebuffers(1, &fbo);
+                        test_rendered = 1;
+                        FLOG("Pxr_PollEvent: test pattern rendered");
+                    }
+                }
                 if (g_layers[i].is_multiview) {
                     if (pvr.EnableSinglePass) pvr.EnableSinglePass(1);
                     int* sp_tex = (int*)dlsym(pvr.handle, "g_iSinglePassTexID");
@@ -1417,6 +1551,19 @@ JNIEXPORT int Pxr_PollEvent(void* event) {
                 /* Submit frame via UnityRenderEvent_ */
                 if (pvr.RenderEvent) {
                     pvr.RenderEvent(RENDER_EVENT_BOTH_EYE_END_FRAME);
+                    /* Clear overlay flag between BOTH_EYE and TIMEWARP */
+                    {
+                        char* evbuf = (char*)dlsym(pvr.handle, "eventBuffer");
+                        if (evbuf) {
+                            char** got_entry = (char**)(evbuf - 0x15F00);
+                            char* s = *got_entry;
+                            if (s) {
+                                *(int*)(s + 0xdabc) = 0;
+                                *(int*)(s + 0xda98) = 0;
+                                *(unsigned char*)(s + 0xd810) = 1;
+                            }
+                        }
+                    }
                     pvr.RenderEvent(RENDER_EVENT_TIMEWARP);
                 }
                 if (poll_count == 0) FLOG("Pxr_PollEvent: first frame submitted");
