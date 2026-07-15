@@ -294,6 +294,52 @@ static int patch_smali_vrshell(const char *smali_path) {
     return 0;
 }
 
+/* Fix RuntimeInitializeOnLoads.json so that StartSubsystems runs
+   AFTER InitializeLoader. Some PXR SDK builds ship with
+   AttemptInitializeXRSDKOnLoad at loadTypes=2 (AfterSceneLoad) while
+   AttemptStartXRSDKOnBeforeSplashScreen is at loadTypes=3 (BeforeSplashScreen).
+   Since BeforeSplashScreen executes before AfterSceneLoad, StartSubsystems
+   gets called before InitializeLoader, fails silently (activeLoader is null),
+   and is never called again - so the render loop never starts.
+   We move AttemptStartXRSDKOnBeforeSplashScreen from loadTypes=3 to
+   loadTypes=2 (AfterSceneLoad) so it runs after InitializeLoader. */
+static int patch_xr_init_order(const char *decoded_dir) {
+    char path[1024];
+    snprintf(path, sizeof(path),
+             "%s/assets/bin/Data/RuntimeInitializeOnLoads.json", decoded_dir);
+    FILE *f = fopen(path, "r");
+    if (!f) return -1;
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    char *buf = malloc(sz + 1);
+    if (!buf) { fclose(f); return -1; }
+    fread(buf, 1, sz, f);
+    buf[sz] = '\0';
+    fclose(f);
+
+    int changed = 0;
+    /* AttemptStartXRSDKOnBeforeSplashScreen: loadTypes 3 -> 2 (AfterSceneLoad)
+       so it runs after AttemptInitializeXRSDKOnLoad which is also at 2 */
+    const char *p1 = "\"methodName\":\"AttemptStartXRSDKOnBeforeSplashScreen\",\"loadTypes\":3";
+    const char *r1 = "\"methodName\":\"AttemptStartXRSDKOnBeforeSplashScreen\",\"loadTypes\":2";
+    char *p = strstr(buf, p1);
+    if (p) {
+        memcpy(p, r1, strlen(r1));
+        changed = 1;
+    }
+
+    if (changed) {
+        f = fopen(path, "w");
+        if (!f) { free(buf); return -1; }
+        fputs(buf, f);
+        fclose(f);
+        printf("[xr-init] fixed RuntimeInitializeOnLoads.json load order\n");
+    }
+    free(buf);
+    return changed ? 0 : -1;
+}
+
 static int patch_manifest(const char *manifest_path) {
     FILE *f = fopen(manifest_path, "r");
     if (!f) {
@@ -663,6 +709,10 @@ int main(int argc, char **argv) {
         if (patch_smali_entitlement(smali_path) == 0)
             break;
     }
+
+    /* Fix XR initialization order so StartSubsystems runs after InitializeLoader */
+    if (patch_xr_init_order(decoded_dir) < 0)
+        fprintf(stderr, "warning: could not patch RuntimeInitializeOnLoads.json\n");
 
     if (apk_type == APK_TYPE_PVR_SDK) {
         inject_shim_pvr(decoded_dir, shim_out);

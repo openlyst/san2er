@@ -14,6 +14,8 @@
 #include <stdlib.h>
 #include <math.h>
 #include <stdint.h>
+#include <stdarg.h>
+#include <stdio.h>
 #include <android/log.h>
 #include <EGL/egl.h>
 #include <GLES3/gl3.h>
@@ -24,6 +26,28 @@
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
+
+/* File-based logging to bypass chatty - use raw write() for reliability */
+#include <fcntl.h>
+#include <unistd.h>
+static void flog(const char* msg) {
+    int fd = open("/sdcard/Android/data/com.ivanovichgames.touringkartsPRO/files/pxr_shim.log",
+                  O_WRONLY | O_CREAT | O_APPEND, 0666);
+    if (fd < 0) {
+        fd = open("/sdcard/pxr_shim.log", O_WRONLY | O_CREAT | O_APPEND, 0666);
+        if (fd < 0) return;
+    }
+    write(fd, msg, strlen(msg));
+    write(fd, "\n", 1);
+    close(fd);
+}
+static void flog_int(const char* prefix, int val) {
+    char buf[128];
+    int n = snprintf(buf, sizeof(buf), "%s%d", prefix, val);
+    if (n > 0) flog(buf);
+}
+#define FLOG(msg) flog(msg)
+#define FLOGI(prefix, val) flog_int(prefix, val)
 
 /* ---- PVR runtime function pointers ---- */
 
@@ -39,6 +63,10 @@ typedef int  (*Pvr_GetMainSensorState_t)(float*, float*, float*, float*,
                                          float*, float*, float*,
                                          float*, float*, int*);
 typedef void (*Pvr_SetupLayerData_t)(int, int, int, int, int, float*); /* layerIndex, sideMask, textureId, textureType, layerFlags, colorScaleAndOffset */
+typedef void (*Pvr_SetCurrentRenderTexture_t)(int); /* textureId */
+typedef void (*Pvr_EnableSinglePass_t)(int); /* enable */
+typedef void (*Pvr_CameraEndFrame_t)(int, int); /* eye, textureId */
+typedef void (*Pvr_TimeWarpEvent_t)(int); /* textureId/frameParam */
 typedef void (*UnityRenderEvent_t)(int);
 typedef int  (*Pvr_GetPsensorState_t)(void);
 typedef int  (*Pvr_GetSensorState_t)(int, float*, float*, float*, float*,
@@ -59,6 +87,10 @@ static struct {
     Pvr_GetFOV_t GetFOV;
     Pvr_GetMainSensorState_t GetMainSensorState;
     Pvr_SetupLayerData_t SetupLayerData;
+    Pvr_SetCurrentRenderTexture_t SetCurrentRenderTexture;
+    Pvr_EnableSinglePass_t EnableSinglePass;
+    Pvr_CameraEndFrame_t CameraEndFrame;
+    Pvr_TimeWarpEvent_t TimeWarpEvent;
     UnityRenderEvent_t RenderEvent;
     Pvr_GetPsensorState_t GetPsensorState;
     Pvr_GetSensorState_t GetSensorState;
@@ -76,6 +108,12 @@ static int g_xr_running = 0;
 static int g_render_thread_inited = 0;
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 
+/* GL multiview extension function pointers */
+typedef void (*PFNGLFRAMEBUFFERTEXTUREMULTIVIEWOVRPROC)(GLenum, GLenum, GLuint, GLint, GLint, GLsizei);
+typedef void (*PFNGLFRAMEBUFFERTEXTURESAMPLEMULTIVIEWOVRPROC)(GLenum, GLenum, GLuint, GLint, GLint, GLsizei);
+static PFNGLFRAMEBUFFERTEXTUREMULTIVIEWOVRPROC g_glFramebufferTextureMultiview = NULL;
+static PFNGLFRAMEBUFFERTEXTURESAMPLEMULTIVIEWOVRPROC g_glFramebufferTextureSampleMultiview = NULL;
+
 /* Layer/swapchain state */
 #define MAX_LAYERS 8
 #define SWAPCHAIN_LEN 2
@@ -87,9 +125,12 @@ struct layer_info {
     int format;
     GLuint textures[SWAPCHAIN_LEN];
     int current_index;
+    int is_multiview;
 };
 
 static struct layer_info g_layers[MAX_LAYERS];
+static int g_keep_submitting = 0;
+static pthread_t g_submit_thread;
 
 /* FOV cache */
 static float g_fov_left = 50.0f;
@@ -151,6 +192,7 @@ enum pxr_config {
 
 static int load_pvr_runtime() {
     if (pvr.handle) return 0;
+    FLOG("load_pvr_runtime: starting");
 
     /* The APK bundles a PVR SDK compat library (libPvr_UnitySDK_compat.so)
        that provides Pvr_SetupLayerData, UnityRenderEvent, etc. This is a
@@ -159,8 +201,10 @@ static int load_pvr_runtime() {
     pvr.handle = dlopen("libPvr_UnitySDK_compat.so", RTLD_NOW | RTLD_LOCAL);
     if (!pvr.handle) {
         LOGE("failed to load libPvr_UnitySDK_compat.so: %s", dlerror());
+        FLOG("load_pvr_runtime: FAILED to load compat lib");
         return -1;
     }
+    FLOG("load_pvr_runtime: loaded compat lib");
     LOGI("loaded libPvr_UnitySDK_compat.so (PVR SDK compat)");
 
     /* Call pvr_OnLoad to initialize the compat library. This sets
@@ -219,6 +263,10 @@ static int load_pvr_runtime() {
     LOAD("Pvr_GetFOV", GetFOV);
     LOAD("Pvr_GetMainSensorState", GetMainSensorState);
     LOAD("Pvr_SetupLayerData", SetupLayerData);
+    LOAD("Pvr_SetCurrentRenderTexture", SetCurrentRenderTexture);
+    LOAD("Pvr_EnableSinglePass", EnableSinglePass);
+    LOAD("PVR_CameraEndFrame_", CameraEndFrame);
+    LOAD("PVR_TimeWarpEvent_", TimeWarpEvent);
     LOAD("UnityRenderEvent", RenderEvent);
     LOAD("Pvr_GetPsensorState", GetPsensorState);
     LOAD("Pvr_GetSensorState", GetSensorState);
@@ -323,15 +371,32 @@ static void init_pvr_runtime(JNIEnv* env) {
 JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* reserved) {
     g_jvm = vm;
     LOGI("JNI_OnLoad pxr_api_shim");
+    FLOG("JNI_OnLoad");
+
+    /* Load GL multiview extension functions */
+    g_glFramebufferTextureMultiview = (PFNGLFRAMEBUFFERTEXTUREMULTIVIEWOVRPROC)eglGetProcAddress("glFramebufferTextureMultiviewOVR");
+    if (!g_glFramebufferTextureMultiview)
+        g_glFramebufferTextureMultiview = (PFNGLFRAMEBUFFERTEXTUREMULTIVIEWOVRPROC)eglGetProcAddress("glFramebufferTextureMultiview");
+    g_glFramebufferTextureSampleMultiview = (PFNGLFRAMEBUFFERTEXTURESAMPLEMULTIVIEWOVRPROC)eglGetProcAddress("glFramebufferTextureSampleMultiviewOVR");
+    if (!g_glFramebufferTextureSampleMultiview)
+        g_glFramebufferTextureSampleMultiview = (PFNGLFRAMEBUFFERTEXTURESAMPLEMULTIVIEWOVRPROC)eglGetProcAddress("glFramebufferTextureSampleMultiview");
+    LOGI("GL multiview: %p %p", g_glFramebufferTextureMultiview, g_glFramebufferTextureSampleMultiview);
 
     /* If Pxr_Initialize was called before JNI_OnLoad (it is, since
        libPxrPlatform.so loads us as a dependency), do the init now. */
     if (g_init_requested && !g_initialized) {
+        FLOG("JNI_OnLoad: init_requested but not initialized, calling init_pvr_runtime");
         JNIEnv* env = NULL;
         if ((*vm)->GetEnv(vm, (void**)&env, JNI_VERSION_1_6) == JNI_OK) {
             init_pvr_runtime(env);
+            FLOG("JNI_OnLoad: init_pvr_runtime done, g_initialized=1?");
+        } else {
+            FLOG("JNI_OnLoad: GetEnv failed");
         }
+    } else {
+        FLOG("JNI_OnLoad: init_requested but g_initialized check");
     }
+    FLOG("JNI_OnLoad done");
     return JNI_VERSION_1_6;
 }
 
@@ -433,15 +498,18 @@ struct PxrLayerHeader {
 
 JNIEXPORT int Pxr_Initialize() {
     LOGI("Pxr_Initialize");
+    FLOG("Pxr_Initialize");
     g_init_requested = 1;
 
     JNIEnv* env = get_env();
     if (env) {
         init_pvr_runtime(env);
+        FLOG("Pxr_Initialize: init_pvr_runtime done");
     } else {
         /* JNI_OnLoad hasn't been called yet. The init will be deferred
            to JNI_OnLoad. This is expected when libPxrPlatform.so loads
            us as a dependency before the Java runtime registers us. */
+        FLOG("Pxr_Initialize: no JNIEnv yet, deferring to JNI_OnLoad");
         LOGW("Pxr_Initialize: no JNIEnv yet, deferring to JNI_OnLoad");
     }
     return 0;
@@ -458,22 +526,26 @@ JNIEXPORT int Pxr_Shutdown() {
 
 JNIEXPORT int Pxr_IsInitialized() {
     LOGI("Pxr_IsInitialized -> %d", g_initialized);
+    FLOG("Pxr_IsInitialized called");
     return g_initialized;
 }
 
 JNIEXPORT int Pxr_IsRunning() {
     LOGI("Pxr_IsRunning -> %d", g_xr_running);
+    FLOG("Pxr_IsRunning called");
     return g_xr_running;
 }
 
 JNIEXPORT int Pxr_BeginXr() {
     LOGI("Pxr_BeginXr");
+    FLOG("Pxr_BeginXr");
     g_xr_running = 1;
     return 0;
 }
 
 JNIEXPORT int Pxr_EndXr() {
     LOGI("Pxr_EndXr");
+    FLOG("Pxr_EndXr");
     if (pvr.RenderEvent && g_render_thread_inited)
         pvr.RenderEvent(RENDER_EVENT_PAUSE);
     g_xr_running = 0;
@@ -482,35 +554,42 @@ JNIEXPORT int Pxr_EndXr() {
 
 JNIEXPORT int Pxr_SetInitializeData(void* data) {
     LOGI("Pxr_SetInitializeData(%p)", data);
+    FLOG("Pxr_SetInitializeData");
     return 0;
 }
 
 JNIEXPORT int Pxr_SetPlatformOption(int type, int value) {
     LOGI("Pxr_SetPlatformOption(%d, %d)", type, value);
+    FLOG("Pxr_SetPlatformOption");
     return 0;
 }
 
 JNIEXPORT int Pxr_SetGraphicOption(int option) {
     LOGI("Pxr_SetGraphicOption(%d)", option);
+    FLOG("Pxr_SetGraphicOption");
     return 0;
 }
 
 JNIEXPORT int Pxr_SetTrackingMode(int mode) {
     LOGI("Pxr_SetTrackingMode(%d)", mode);
+    FLOG("Pxr_SetTrackingMode");
     return 0;
 }
 
 JNIEXPORT int Pxr_GetTrackingMode(int* mode) {
+    LOGI("Pxr_GetTrackingMode");
     if (mode) *mode = 0;
     return 0;
 }
 
 JNIEXPORT int Pxr_SetTrackingOrigin(int origin) {
     LOGI("Pxr_SetTrackingOrigin(%d)", origin);
+    FLOG("Pxr_SetTrackingOrigin");
     return 0;
 }
 
 JNIEXPORT int Pxr_GetTrackingOrigin(int* origin) {
+    LOGI("Pxr_GetTrackingOrigin");
     if (origin) *origin = 0;
     return 0;
 }
@@ -553,7 +632,42 @@ static void print_backtrace(const char* label) {
 
 /* ---- Layer / Swapchain ---- */
 
+/* Background thread that continuously submits frames to PVR TimeWarp.
+   Needed because the game's C# display subsystem never enters "running"
+   state (StartSubsystems is never called), so Unity never calls the
+   render loop callbacks. Without continuous frame submission, TimeWarp
+   shows "No valid Eye Buffers" and the headset stays black. */
+static void* submit_thread_fn(void* arg) {
+    (void)arg;
+    FLOG("submit_thread: started");
+    int frame_count = 0;
+    while (g_keep_submitting) {
+        for (int i = 0; i < MAX_LAYERS; i++) {
+            if (g_layers[i].in_use && pvr.SetupLayerData && pvr.RenderEvent) {
+                float colorScaleOffset[8] = {1, 1, 1, 1, 0, 0, 0, 0};
+                GLuint tex = g_layers[i].textures[0];
+                int texType = g_layers[i].is_multiview ? 1 : 0;
+                if (g_layers[i].is_multiview) {
+                    pvr.SetupLayerData(0, 3, tex, 0x910A, 0, colorScaleOffset);
+                } else {
+                    pvr.SetupLayerData(0, 1, tex, 0x0DE1, 0, colorScaleOffset);
+                    pvr.SetupLayerData(0, 2, g_layers[i].textures[1], 0x0DE1, 0, colorScaleOffset);
+                }
+                pvr.RenderEvent(RENDER_EVENT_BOTH_EYE_END_FRAME);
+                if (frame_count == 0) FLOG("submit_thread: first frame submitted");
+                frame_count++;
+                break;
+            }
+        }
+        usleep(13000); /* ~72fps */
+    }
+    FLOG("submit_thread: stopped");
+    return NULL;
+}
+
 JNIEXPORT int Pxr_CreateLayer(void* layerParamPtr) {
+    FLOG("Pxr_CreateLayer called");
+    FLOG("Pxr_CreateLayer step 1: dump raw bytes");
     /* Dump raw bytes to figure out the struct layout */
     unsigned int* raw = (unsigned int*)layerParamPtr;
     if (raw) {
@@ -565,15 +679,19 @@ JNIEXPORT int Pxr_CreateLayer(void* layerParamPtr) {
              raw64[0], raw64[1], raw64[2], raw64[3], raw64[4], raw64[5]);
     }
 
+    FLOG("Pxr_CreateLayer step 2: backtrace");
     /* Print backtrace to see who's calling */
     print_backtrace("Pxr_CreateLayer");
 
+    FLOG("Pxr_CreateLayer step 3: parse params");
     struct PxrLayerParam* p = (struct PxrLayerParam*)layerParamPtr;
     int width = p ? (int)p->width : 1440;
     int height = p ? (int)p->height : 1584;
 
     LOGI("Pxr_CreateLayer w=%d h=%d format=%llu", width, height, p ? p->format : 0);
+    FLOG("Pxr_CreateLayer parsed params");
 
+    FLOG("Pxr_CreateLayer step 4: find slot");
     int slot = -1;
     for (int i = 0; i < MAX_LAYERS; i++) {
         if (!g_layers[i].in_use) {
@@ -583,9 +701,11 @@ JNIEXPORT int Pxr_CreateLayer(void* layerParamPtr) {
     }
     if (slot < 0) {
         LOGE("no free layer slots");
+        FLOG("Pxr_CreateLayer ERROR: no free slots");
         return -1;
     }
 
+    FLOG("Pxr_CreateLayer step 5: setup layer");
     g_layers[slot].in_use = 1;
     g_layers[slot].width = width;
     g_layers[slot].height = height;
@@ -594,10 +714,18 @@ JNIEXPORT int Pxr_CreateLayer(void* layerParamPtr) {
 
     int arraySize = p ? (int)p->arraySize : 1;
     int is_multiview = (arraySize >= 2);
+    g_layers[slot].is_multiview = is_multiview;
+    FLOGI("Pxr_CreateLayer: arraySize=", arraySize);
+    FLOGI("Pxr_CreateLayer: is_multiview=", is_multiview);
+    FLOGI("Pxr_CreateLayer: width=", width);
+    FLOGI("Pxr_CreateLayer: height=", height);
+    FLOG("Pxr_CreateLayer step 5b: arraySize checked");
 
+    FLOG("Pxr_CreateLayer step 6: glGenTextures");
     /* Create swapchain textures. For multiview layers (arraySize>=2),
        use GL_TEXTURE_2D_ARRAY with 2 layers for stereo rendering. */
     glGenTextures(SWAPCHAIN_LEN, g_layers[slot].textures);
+    FLOG("Pxr_CreateLayer step 7: textures created");
     for (int i = 0; i < SWAPCHAIN_LEN; i++) {
         if (is_multiview) {
             glBindTexture(GL_TEXTURE_2D_ARRAY, g_layers[slot].textures[i]);
@@ -619,11 +747,13 @@ JNIEXPORT int Pxr_CreateLayer(void* layerParamPtr) {
     }
     glBindTexture(is_multiview ? GL_TEXTURE_2D_ARRAY : GL_TEXTURE_2D, 0);
 
+    FLOG("Pxr_CreateLayer step 8: textures configured");
     LOGI("Pxr_CreateLayer -> slot %d, textures [%u, %u]",
          slot, g_layers[slot].textures[0], g_layers[slot].textures[1]);
 
     if (p) p->layerId = slot;
 
+    FLOG("Pxr_CreateLayer step 9: auto-start XR");
     /* Auto-start XR if not already running - the game creates a layer
        when it's ready to render, so this is the right time to start XR */
     if (!g_xr_running) {
@@ -631,40 +761,184 @@ JNIEXPORT int Pxr_CreateLayer(void* layerParamPtr) {
         g_xr_running = 1;
     }
 
+    FLOG("Pxr_CreateLayer step 10: init render thread");
     /* Set up the layer textures for PVR TimeWarp and init render thread.
        We're on the render thread so EGL context is available. */
+    EGLContext ctx = eglGetCurrentContext();
+    EGLDisplay dpy = eglGetCurrentDisplay();
+    FLOGI("Pxr_CreateLayer: EGL ctx=", (int)(uintptr_t)ctx);
+    FLOGI("Pxr_CreateLayer: EGL dpy=", (int)(uintptr_t)dpy);
     if (!g_render_thread_inited && pvr.RenderEvent) {
         LOGI("initializing PVR render thread from Pxr_CreateLayer");
         pvr.RenderEvent(RENDER_EVENT_INIT_RENDER_THREAD);
         g_render_thread_inited = 1;
         LOGI("PVR render thread init returned");
     }
+    FLOG("Pxr_CreateLayer step 11: render thread done");
 
     if (pvr.SetupLayerData && pvr.RenderEvent) {
         float colorScaleOffset[8] = {1, 1, 1, 1, 0, 0, 0, 0};
         GLuint tex = g_layers[slot].textures[0];
-        LOGI("setting up PVR layer data with tex %u", tex);
-        pvr.SetupLayerData(0, 3, tex, 0, 0, colorScaleOffset);
-        pvr.SetupLayerData(0, 1, tex, 0, 0, colorScaleOffset);
-        pvr.RenderEvent(RENDER_EVENT_BOTH_EYE_END_FRAME);
+        /* PVR SDK uses GL enum values for textureType:
+           GL_TEXTURE_2D=0x0DE1, GL_TEXTURE_2D_ARRAY=0x910A */
+        int texType = is_multiview ? 0x910A : 0x0DE1;
+        LOGI("setting up PVR layer data with tex %u (type 0x%x, mv=%d)", tex, texType, is_multiview);
+
+        /* Clear textures to a solid color via FBO so TimeWarp has valid
+           eye buffers. Without this, TimeWarp rejects them as "No valid
+           Eye Buffers" because they've never been rendered to. */
+        GLuint fbo;
+        glGenFramebuffers(1, &fbo);
+        glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+        if (is_multiview) {
+            if (g_glFramebufferTextureMultiview) {
+                g_glFramebufferTextureMultiview(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                    tex, 0, 0, arraySize);
+            }
+        } else {
+            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                GL_TEXTURE_2D, tex, 0);
+        }
+        GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+        FLOGI("Pxr_CreateLayer: FBO status=", (int)status);
+        if (status == GL_FRAMEBUFFER_COMPLETE) {
+            glViewport(0, 0, width, height);
+            glClearColor(0.2f, 0.3f, 0.5f, 1.0f);
+            glClear(GL_COLOR_BUFFER_BIT);
+            FLOG("Pxr_CreateLayer: cleared eye texture");
+        } else {
+            FLOG("Pxr_CreateLayer: FBO incomplete, skipping clear");
+        }
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        glDeleteFramebuffers(1, &fbo);
+
+        /* Set current render texture before SetupLayerData - PVR SDK
+           requires this to know which texture to use for each eye.
+           Pvr_SetCurrentRenderTexture takes just one arg (textureId). */
+        if (pvr.SetCurrentRenderTexture) {
+            pvr.SetCurrentRenderTexture(tex);
+            FLOG("Pxr_CreateLayer: SetCurrentRenderTexture called");
+        }
+
+        /* For multiview, enable single-pass mode and set the single-pass
+           texture ID directly. The PVR SDK uses g_iSinglePassTexID for
+           multiview rendering. */
+        if (is_multiview) {
+            if (pvr.EnableSinglePass) {
+                pvr.EnableSinglePass(1);
+                FLOG("Pxr_CreateLayer: EnableSinglePass(1) called");
+            }
+            int* g_iSinglePassTexID = (int*)dlsym(pvr.handle, "g_iSinglePassTexID");
+            if (g_iSinglePassTexID) {
+                *g_iSinglePassTexID = tex;
+                FLOGI("Pxr_CreateLayer: g_iSinglePassTexID=", (int)tex);
+            }
+        }
+
+        if (is_multiview) {
+            /* Multiview: single texture array, store for both eyes */
+            pvr.SetupLayerData(0, 1, tex, texType, 0, colorScaleOffset);
+            pvr.SetupLayerData(0, 2, tex, texType, 0, colorScaleOffset);
+        } else {
+            /* Non-multiview: separate textures for each eye */
+            pvr.SetupLayerData(0, 1, tex, texType, 0, colorScaleOffset);
+            pvr.SetupLayerData(0, 2, g_layers[slot].textures[1], texType, 0, colorScaleOffset);
+        }
+        /* Set eye textures directly via PVR_CameraEndFrame_ */
+        if (pvr.CameraEndFrame) {
+            pvr.CameraEndFrame(0, tex);
+            pvr.CameraEndFrame(1, is_multiview ? tex : g_layers[slot].textures[1]);
+            FLOG("Pxr_CreateLayer: CameraEndFrame called");
+        }
+        /* Also set textures directly in the PVR structure, in case
+           CameraEndFrame_ skips due to the flag at offset 104 being 0.
+           Read the actual struct pointer from the GOT entry. */
+        {
+            char* evbuf = (char*)dlsym(pvr.handle, "eventBuffer");
+            if (evbuf) {
+                /* GOT entry at link-time 0x1fa100 contains the struct pointer.
+                   eventBuffer is at link-time 0x210000.
+                   GOT offset from eventBuffer = 0x1fa100 - 0x210000 = -0x15F00 */
+                char** got_entry = (char**)(evbuf - 0x15F00);
+                char* pvr_struct = *got_entry;
+                FLOGI("Pxr_CreateLayer: evbuf=", (int)(uintptr_t)evbuf);
+                FLOGI("Pxr_CreateLayer: pvr_struct=", (int)(uintptr_t)pvr_struct);
+                if (pvr_struct) {
+                    pvr_struct[104] = 1;
+                    *(int*)(pvr_struct + 76) = tex;
+                    *(int*)(pvr_struct + 80) = is_multiview ? tex : g_layers[slot].textures[1];
+                    /* Clear overlay model flags. PVR_TimeWarpEvent_ checks
+                       struct[0xdabc] (==1 → overlay, ==0 → eyebuffer).
+                       Also clear struct[0xda98] and struct[0x5364]. */
+                    *(int*)(pvr_struct + 0xdabc) = 0;
+                    *(int*)(pvr_struct + 0xda98) = 0;
+                    *(int*)(pvr_struct + 0x5364) = 0;
+                    /* Set the flag at struct[0xd810] so the eyebuffer path
+                       is taken without needing struct[80] to be checked. */
+                    *(unsigned char*)(pvr_struct + 0xd810) = 1;
+                    /* Store texture IDs at offsets read by UnityRenderEvent_.
+                       BOTH_EYE_END_FRAME reads [struct+0xf960]+[struct+0xf964]
+                         and passes the sum to PVR_CameraEndFrame as texture ID.
+                       TIMEWARP reads [struct+0xf928]+[struct+0xf92c]
+                         and passes the sum to PVR_TimeWarpEvent as a parameter.
+                       PVR_TimeWarpEvent_ checks parameter <= 63 and exits
+                         early if not. This parameter is NOT the texture ID -
+                         it's a small frame/sequence value. Store 0 there. */
+                    *(int*)(pvr_struct + 0xf960) = tex;
+                    *(int*)(pvr_struct + 0xf964) = 0;
+                    *(int*)(pvr_struct + 0xf928) = 0;
+                    *(int*)(pvr_struct + 0xf92c) = 0;
+                    /* Also store right eye texture for non-multiview */
+                    if (!is_multiview) {
+                        *(int*)(pvr_struct + 0xf918) = g_layers[slot].textures[1];
+                        *(int*)(pvr_struct + 0xf91c) = 0;
+                    }
+                    FLOG("Pxr_CreateLayer: set struct flag+tex via GOT");
+                }
+            }
+        }
+        /* Submit frame via UnityRenderEvent_ (bypasses message queue).
+           Call BOTH_EYE_END_FRAME to set eye textures, then TIMEWARP. */
+        if (pvr.RenderEvent) {
+            pvr.RenderEvent(RENDER_EVENT_BOTH_EYE_END_FRAME);
+            pvr.RenderEvent(RENDER_EVENT_TIMEWARP);
+            FLOG("Pxr_CreateLayer: RenderEvent BOTH_EYE+TIMEWARP called");
+        }
         LOGI("submitted first frame to PVR TimeWarp");
     }
+    FLOG("Pxr_CreateLayer step 12: layer data submitted");
+
+    /* Frame submission is handled by Pxr_PollEvent (called every frame
+       from the same thread as Pxr_CreateLayer, ensuring GL context
+       compatibility). No background thread needed. */
 
     LOGI("Pxr_CreateLayer returning slot %d", slot);
+    FLOG("Pxr_CreateLayer returning");
     return slot;
 }
 
 JNIEXPORT int Pxr_DestroyLayer(int layerId) {
     LOGI("Pxr_DestroyLayer(%d)", layerId);
+    FLOG("Pxr_DestroyLayer");
     if (layerId < 0 || layerId >= MAX_LAYERS || !g_layers[layerId].in_use)
         return -1;
+    g_layers[layerId].in_use = 0;
     glDeleteTextures(SWAPCHAIN_LEN, g_layers[layerId].textures);
     memset(&g_layers[layerId], 0, sizeof(g_layers[layerId]));
+    /* Stop submit thread if no layers remain */
+    int any = 0;
+    for (int i = 0; i < MAX_LAYERS; i++)
+        if (g_layers[i].in_use) { any = 1; break; }
+    if (!any && g_keep_submitting) {
+        g_keep_submitting = 0;
+        pthread_join(g_submit_thread, NULL);
+    }
     return 0;
 }
 
 JNIEXPORT int Pxr_GetLayerImageCount(int layerId, int eye, unsigned int* count) {
     LOGI("Pxr_GetLayerImageCount(%d, %d)", layerId, eye);
+    FLOG("Pxr_GetLayerImageCount");
     if (count) *count = SWAPCHAIN_LEN;
     return 0;
 }
@@ -676,6 +950,7 @@ JNIEXPORT int Pxr_GetLayerNextImageIndex(int layerId, int* imageIndex) {
     g_layers[layerId].current_index = (idx + 1) % SWAPCHAIN_LEN;
     if (imageIndex) *imageIndex = idx;
     LOGI("Pxr_GetLayerNextImageIndex(%d) -> %d", layerId, idx);
+    FLOG("Pxr_GetLayerNextImageIndex");
     return 0;
 }
 
@@ -686,6 +961,7 @@ JNIEXPORT int Pxr_GetLayerImage(int layerId, int eye, int imageIndex, unsigned l
         return -1;
     if (image) *image = (unsigned long long)g_layers[layerId].textures[imageIndex];
     LOGI("Pxr_GetLayerImage(%d, %d, %d) -> %llu", layerId, eye, imageIndex, image ? *image : 0);
+    FLOG("Pxr_GetLayerImage");
     return 0;
 }
 
@@ -694,29 +970,39 @@ JNIEXPORT int Pxr_GetLayerFoveationImage(int layerId, int eye, int imageIndex, u
 }
 
 JNIEXPORT void Pxr_SetCreateLayerParam(void* param) {
+    LOGI("Pxr_SetCreateLayerParam");
+    FLOG("Pxr_SetCreateLayerParam");
     /* called by PxrPlatform before Pxr_CreateLayer, we handle it in CreateLayer */
 }
 
 JNIEXPORT void Pxr_DestroyLayerByRender(int layerId) {
+    LOGI("Pxr_DestroyLayerByRender(%d)", layerId);
+    FLOG("Pxr_DestroyLayer");
     Pxr_DestroyLayer(layerId);
 }
 
 /* ---- Frame ---- */
 
 JNIEXPORT int Pxr_WaitFrame() {
+    FLOG("Pxr_WaitFrame");
     LOGI("Pxr_WaitFrame");
+    FLOG("Pxr_WaitFrame");
     return 0;
 }
 
 JNIEXPORT int Pxr_BeginFrame() {
+    FLOG("Pxr_BeginFrame");
     LOGI("Pxr_BeginFrame");
+    FLOG("Pxr_BeginFrame");
     return 0;
 }
 
 JNIEXPORT int Pxr_EndFrame() {
+    FLOG("Pxr_EndFrame");
     /* Init render thread on first EndFrame (needs EGL context) */
     if (!g_render_thread_inited && pvr.RenderEvent) {
         LOGI("initializing PVR render thread");
+        FLOG("initializing PVR render thread");
         pvr.RenderEvent(RENDER_EVENT_INIT_RENDER_THREAD);
         g_render_thread_inited = 1;
     }
@@ -729,6 +1015,8 @@ JNIEXPORT int Pxr_EndFrame() {
 }
 
 JNIEXPORT int Pxr_CanBeginVR() {
+    LOGI("Pxr_CanBeginVR -> 1");
+    FLOG("Pxr_CanBeginVR");
     return 1;
 }
 
@@ -741,6 +1029,7 @@ JNIEXPORT int Pxr_SubmitLayer(void* layerPtr) {
 
     int texId = (int)g_layers[h->layerId].textures[h->imageIndex % SWAPCHAIN_LEN];
     LOGI("Pxr_SubmitLayer layer=%d imageIdx=%d tex=%u", h->layerId, h->imageIndex, texId);
+    FLOG("Pxr_SubmitLayer");
 
     /* Submit to PVR TimeWarp: layer 0, both eyes, texture, type=0, flags=0 */
     if (pvr.SetupLayerData) {
@@ -753,28 +1042,34 @@ JNIEXPORT int Pxr_SubmitLayer(void* layerPtr) {
 
 JNIEXPORT int Pxr_SubmitLayer2(void* layerPtr) {
     LOGI("Pxr_SubmitLayer2");
+    FLOG("Pxr_SubmitLayer");
     return Pxr_SubmitLayer(layerPtr);
 }
 
 JNIEXPORT int Pxr_SubmitLayerProjection(void* layer) {
-    return 0;
+    LOGI("Pxr_SubmitLayerProjection");
+    FLOG("Pxr_SubmitLayer");
+    return Pxr_SubmitLayer(layer);
 }
 JNIEXPORT int Pxr_SubmitLayerProjection2(void* layer) {
-    return 0;
+    LOGI("Pxr_SubmitLayerProjection2");
+    FLOG("Pxr_SubmitLayer");
+    return Pxr_SubmitLayer(layer);
 }
-JNIEXPORT int Pxr_SubmitLayerQuad(void* layer) { return 0; }
-JNIEXPORT int Pxr_SubmitLayerQuad2(void* layer) { return 0; }
-JNIEXPORT int Pxr_SubmitLayerCylinder(void* layer) { return 0; }
-JNIEXPORT int Pxr_SubmitLayerCylinder2(void* layer) { return 0; }
-JNIEXPORT int Pxr_SubmitLayerEquirect(void* layer) { return 0; }
-JNIEXPORT int Pxr_SubmitLayerEquirect2(void* layer) { return 0; }
-JNIEXPORT int Pxr_SubmitLayerCube2(void* layer) { return 0; }
+JNIEXPORT int Pxr_SubmitLayerQuad(void* layer) { LOGI("Pxr_SubmitLayerQuad"); FLOG("Pxr_SubmitLayerQuad"); return 0; }
+JNIEXPORT int Pxr_SubmitLayerQuad2(void* layer) { LOGI("Pxr_SubmitLayerQuad2"); FLOG("Pxr_SubmitLayerQuad2"); return 0; }
+JNIEXPORT int Pxr_SubmitLayerCylinder(void* layer) { LOGI("Pxr_SubmitLayerCylinder"); FLOG("Pxr_SubmitLayerCylinder"); return 0; }
+JNIEXPORT int Pxr_SubmitLayerCylinder2(void* layer) { LOGI("Pxr_SubmitLayerCylinder2"); FLOG("Pxr_SubmitLayerCylinder2"); return 0; }
+JNIEXPORT int Pxr_SubmitLayerEquirect(void* layer) { LOGI("Pxr_SubmitLayerEquirect"); FLOG("Pxr_SubmitLayerEquirect"); return 0; }
+JNIEXPORT int Pxr_SubmitLayerEquirect2(void* layer) { LOGI("Pxr_SubmitLayerEquirect2"); FLOG("Pxr_SubmitLayerEquirect2"); return 0; }
+JNIEXPORT int Pxr_SubmitLayerCube2(void* layer) { LOGI("Pxr_SubmitLayerCube2"); FLOG("Pxr_SubmitLayerCube2"); return 0; }
 
 /* ---- Sensor / Pose ---- */
 
 JNIEXPORT int Pxr_GetPredictedMainSensorState2(double predictTimeMs,
         struct PxrSensorState2* sensorState, int* sensorFrameIndex) {
     LOGI("Pxr_GetPredictedMainSensorState2(%f)", predictTimeMs);
+    FLOG("Pxr_GetPredictedMainSensorState2");
     if (!sensorState) return -1;
     memset(sensorState, 0, sizeof(*sensorState));
 
@@ -822,6 +1117,7 @@ JNIEXPORT int Pxr_GetPredictedMainSensorState2(double predictTimeMs,
 JNIEXPORT int Pxr_GetPredictedMainSensorState(double predictTimeMs,
         struct PxrSensorState* sensorState) {
     LOGI("Pxr_GetPredictedMainSensorState(%f)", predictTimeMs);
+    FLOG("Pxr_GetPredictedMainSensorState");
     if (!sensorState) return -1;
     memset(sensorState, 0, sizeof(*sensorState));
 
@@ -845,14 +1141,20 @@ JNIEXPORT int Pxr_GetPredictedMainSensorState(double predictTimeMs,
 }
 
 JNIEXPORT int Pxr_GetPredictedMainSensorStateWithEyePose(double t, void* s) {
+    LOGI("Pxr_GetPredictedMainSensorStateWithEyePose");
+    FLOG("Pxr_GetPredictedMainSensorState");
     return Pxr_GetPredictedMainSensorState(t, (struct PxrSensorState*)s);
 }
 
 JNIEXPORT int Pxr_GetHeadSensorData(double t, void* s) {
+    LOGI("Pxr_GetHeadSensorData");
+    FLOG("Pxr_GetHeadSensorData");
     return Pxr_GetPredictedMainSensorState(t, (struct PxrSensorState*)s);
 }
 
 JNIEXPORT int Pxr_GetPredictedDisplayTime(double* t) {
+    LOGI("Pxr_GetPredictedDisplayTime");
+    FLOG("Pxr_GetPredictedDisplayTime");
     if (t) *t = 0.0;
     return 0;
 }
@@ -861,6 +1163,8 @@ JNIEXPORT int Pxr_GetPredictedDisplayTime(double* t) {
 
 JNIEXPORT int Pxr_GetFov(int eye, float* fovLeft, float* fovRight,
                          float* fovUp, float* fovDown) {
+    LOGI("Pxr_GetFov(%d)", eye);
+    FLOG("Pxr_GetFov");
     if (!g_fov_cached) {
         if (pvr.GetMainSensorState) {
             float x, y, z, w, px, py, pz, vfov, hfov;
@@ -888,11 +1192,14 @@ JNIEXPORT int Pxr_GetFov(int eye, float* fovLeft, float* fovRight,
 
 JNIEXPORT int Pxr_SetFrustum(int eye, float fl, float fr, float fu,
                              float fd, float n, float f) {
+    LOGI("Pxr_SetFrustum(%d)", eye);
     return 0;
 }
 
 JNIEXPORT int Pxr_GetFrustum(int eye, float* fl, float* fr, float* fu,
                              float* fd, float* n, float* f) {
+    LOGI("Pxr_GetFrustum(%d)", eye);
+    FLOG("Pxr_GetFrustum");
     Pxr_GetFov(eye, fl, fr, fu, fd);
     if (n) *n = 0.1f;
     if (f) *f = 100.0f;
@@ -903,39 +1210,65 @@ JNIEXPORT int Pxr_GetFrustum(int eye, float* fl, float* fr, float* fu,
 
 JNIEXPORT int Pxr_GetConfigInt(int configIndex, int* value) {
     if (!value) return -1;
+    FLOGI("Pxr_GetConfigInt idx=", configIndex);
     int ret;
     switch (configIndex) {
     case PXR_CFG_RENDER_TEX_W:
         if (pvr.GetIntConfig) {
             ret = pvr.GetIntConfig(PVR_ICFG_EYE_TEX_RES0, value);
             LOGI("Pxr_GetConfigInt(%d) [RENDER_TEX_W] -> %d (val=%d)", configIndex, ret, *value);
+            FLOG("Pxr_GetConfigInt");
             if (ret != 0 || *value <= 0) { *value = 1440; ret = 0; }
             return ret;
         }
         *value = 1440;
         LOGI("Pxr_GetConfigInt(%d) [RENDER_TEX_W] -> fallback 1440", configIndex);
+        FLOG("Pxr_GetConfigInt");
         return 0;
     case PXR_CFG_RENDER_TEX_H:
         if (pvr.GetIntConfig) {
             ret = pvr.GetIntConfig(PVR_ICFG_EYE_TEX_RES1, value);
             LOGI("Pxr_GetConfigInt(%d) [RENDER_TEX_H] -> %d (val=%d)", configIndex, ret, *value);
+            FLOG("Pxr_GetConfigInt");
             if (ret != 0 || *value <= 0) { *value = 1584; ret = 0; }
             return ret;
         }
         *value = 1584;
         LOGI("Pxr_GetConfigInt(%d) [RENDER_TEX_H] -> fallback 1584", configIndex);
+        FLOG("Pxr_GetConfigInt");
         return 0;
     case PXR_CFG_TARGET_FRAME_RATE:
         *value = 72;
         LOGI("Pxr_GetConfigInt(%d) [TARGET_FRAME_RATE] -> 72", configIndex);
+        FLOG("Pxr_GetConfigInt");
         return 0;
     case PXR_CFG_SYSTEM_DISPLAY_RATE:
         *value = 72;
         LOGI("Pxr_GetConfigInt(%d) [SYSTEM_DISPLAY_RATE] -> 72", configIndex);
+        FLOG("Pxr_GetConfigInt");
+        return 0;
+    case 28:
+        /* Entitlement check - return 1 to indicate passed */
+        *value = 1;
+        LOGI("Pxr_GetConfigInt(%d) [ENTITLEMENT] -> 1", configIndex);
+        FLOG("Pxr_GetConfigInt(28)->1");
+        return 0;
+    case 5:
+        /* Unknown config - return 1 */
+        *value = 1;
+        LOGI("Pxr_GetConfigInt(%d) -> 1", configIndex);
+        FLOG("Pxr_GetConfigInt(5)->1");
+        return 0;
+    case 8:
+        /* UnityLogLevel - return 2 (Debug) to enable all PXR logs */
+        *value = 2;
+        LOGI("Pxr_GetConfigInt(%d) [UnityLogLevel] -> 2", configIndex);
+        FLOG("Pxr_GetConfigInt(8)->2");
         return 0;
     default:
         *value = 0;
         LOGI("Pxr_GetConfigInt(%d) -> default 0", configIndex);
+        FLOG("Pxr_GetConfigInt");
         return 0;
     }
 }
@@ -956,18 +1289,24 @@ JNIEXPORT int Pxr_GetConfigFloat(int configIndex, float* value) {
 }
 
 JNIEXPORT int Pxr_SetConfigInt(int configIndex, int value) {
+    LOGI("Pxr_SetConfigInt(%d, %d)", configIndex, value);
+    FLOG("Pxr_SetConfigInt");
     return 0;
 }
 
 JNIEXPORT int Pxr_SetConfigString(int configIndex, const char* value) {
+    LOGI("Pxr_SetConfigString(%d, %s)", configIndex, value ? value : "null");
     return 0;
 }
 
 JNIEXPORT int Pxr_SetConfigUint64(int configIndex, unsigned long long value) {
+    LOGI("Pxr_SetConfigUint64(%d, %llu)", configIndex, value);
     return 0;
 }
 
 JNIEXPORT int Pxr_SetConfigIntArray(int configIndex, int* data, int count) {
+    LOGI("Pxr_SetConfigIntArray(%d, %d)", configIndex, count);
+    FLOG("Pxr_SetConfigInt");
     return 0;
 }
 
@@ -983,6 +1322,7 @@ JNIEXPORT int Pxr_GetConfigViewsInfos(void* a, void* b) { return 0; }
 
 JNIEXPORT int Pxr_SetDisplayRefreshRate(float rate) {
     LOGI("Pxr_SetDisplayRefreshRate(%f)", rate);
+    FLOG("Pxr_SetDisplayRefreshRate");
     return 0;
 }
 
@@ -1004,9 +1344,89 @@ JNIEXPORT int Pxr_SetExtraLatencyMode(int mode) { return 0; }
 
 /* ---- Focus / App state ---- */
 
-JNIEXPORT int Pxr_GetAppHasFocus() { LOGI("Pxr_GetAppHasFocus -> 1"); return 1; }
-JNIEXPORT int Pxr_GetTrackingState() { LOGI("Pxr_GetTrackingState -> 1"); return 1; }
-JNIEXPORT int Pxr_PollEvent(void* event) { return 0; }
+JNIEXPORT int Pxr_GetAppHasFocus() { LOGI("Pxr_GetAppHasFocus -> 1"); FLOG("Pxr_GetAppHasFocus"); return 1; }
+JNIEXPORT int Pxr_GetTrackingState() { LOGI("Pxr_GetTrackingState -> 1"); FLOG("Pxr_GetTrackingState"); return 1; }
+JNIEXPORT int Pxr_PollEvent(void* event) {
+    /* Submit frames to PVR TimeWarp from here - this is called every
+       frame from the same thread that called Pxr_CreateLayer, ensuring
+       GL context compatibility. The game's render loop never starts
+       (display subsystem Start() is never called), so we feed TimeWarp
+       directly. */
+    static int poll_count = 0;
+    if (g_render_thread_inited && pvr.RenderEvent) {
+        /* Check GL context */
+        void* (*eglGetCurrentContext)(void) = (void*(*)(void))dlsym(RTLD_DEFAULT, "eglGetCurrentContext");
+        if (eglGetCurrentContext) {
+            void* ctx = eglGetCurrentContext();
+            FLOGI("Pxr_PollEvent: GL ctx=", (int)(uintptr_t)ctx);
+        }
+        for (int i = 0; i < MAX_LAYERS; i++) {
+            if (g_layers[i].in_use) {
+                float colorScaleOffset[8] = {1, 1, 1, 1, 0, 0, 0, 0};
+                GLuint tex = g_layers[i].textures[0];
+                if (pvr.SetCurrentRenderTexture) {
+                    pvr.SetCurrentRenderTexture(tex);
+                }
+                if (g_layers[i].is_multiview) {
+                    if (pvr.EnableSinglePass) pvr.EnableSinglePass(1);
+                    int* sp_tex = (int*)dlsym(pvr.handle, "g_iSinglePassTexID");
+                    if (sp_tex) *sp_tex = tex;
+                    if (pvr.SetupLayerData) {
+                        pvr.SetupLayerData(0, 1, tex, 0x910A, 0, colorScaleOffset);
+                        pvr.SetupLayerData(0, 2, tex, 0x910A, 0, colorScaleOffset);
+                    }
+                } else {
+                    if (pvr.SetupLayerData) {
+                        pvr.SetupLayerData(0, 1, tex, 0x0DE1, 0, colorScaleOffset);
+                        pvr.SetupLayerData(0, 2, g_layers[i].textures[1], 0x0DE1, 0, colorScaleOffset);
+                    }
+                }
+                /* Call PVR_CameraEndFrame_ directly to set eye textures.
+                   The event queue is empty because nothing pushes to it,
+                   so UnityRenderEvent(BOTH_EYE_END_FRAME) does nothing.
+                   Bypass the queue by setting textures directly. */
+                if (pvr.CameraEndFrame) {
+                    pvr.CameraEndFrame(0, tex);
+                    pvr.CameraEndFrame(1, g_layers[i].is_multiview ? tex : g_layers[i].textures[1]);
+                }
+                /* Also set textures directly in the PVR structure via GOT */
+                {
+                    char* evbuf = (char*)dlsym(pvr.handle, "eventBuffer");
+                    if (evbuf) {
+                        char** got_entry = (char**)(evbuf - 0x15F00);
+                        char* pvr_struct = *got_entry;
+                        if (pvr_struct) {
+                            pvr_struct[104] = 1;
+                            *(int*)(pvr_struct + 76) = tex;
+                            *(int*)(pvr_struct + 80) = g_layers[i].is_multiview ? tex : g_layers[i].textures[1];
+                            *(int*)(pvr_struct + 0xdabc) = 0;
+                            *(int*)(pvr_struct + 0xda98) = 0;
+                            *(int*)(pvr_struct + 0x5364) = 0;
+                            *(unsigned char*)(pvr_struct + 0xd810) = 1;
+                            *(int*)(pvr_struct + 0xf960) = tex;
+                            *(int*)(pvr_struct + 0xf964) = 0;
+                            *(int*)(pvr_struct + 0xf928) = 0;
+                            *(int*)(pvr_struct + 0xf92c) = 0;
+                            if (!g_layers[i].is_multiview) {
+                                *(int*)(pvr_struct + 0xf918) = g_layers[i].textures[1];
+                                *(int*)(pvr_struct + 0xf91c) = 0;
+                            }
+                        }
+                    }
+                }
+                /* Submit frame via UnityRenderEvent_ */
+                if (pvr.RenderEvent) {
+                    pvr.RenderEvent(RENDER_EVENT_BOTH_EYE_END_FRAME);
+                    pvr.RenderEvent(RENDER_EVENT_TIMEWARP);
+                }
+                if (poll_count == 0) FLOG("Pxr_PollEvent: first frame submitted");
+                poll_count++;
+                break;
+            }
+        }
+    }
+    return 0;
+}
 
 /* ---- Missing functions needed by libPxrPlatform.so ---- */
 
@@ -1041,6 +1461,7 @@ JNIEXPORT void* Pxr_GetLayerImagePtr(int layerId, int eye, int imageIndex) {
 
 JNIEXPORT int Pxr_EnableMultiview(int enable) {
     LOGI("Pxr_EnableMultiview(%d)", enable);
+    FLOG("Pxr_EnableMultiview");
     return 0;
 }
 
@@ -1252,6 +1673,21 @@ JNIEXPORT void Pxr_SetOriginOfLargeSpace(float x, float y, float z) {}
 
 typedef void (*RenderEventFunc_t)(int event);
 
+/* GL multiview wrapper functions (exported for display subsystem) */
+JNIEXPORT void glFramebufferTextureMultiview(GLenum target, GLenum attachment,
+        GLuint texture, GLint level, GLint baseViewIndex, GLsizei numViews) {
+    if (g_glFramebufferTextureMultiview) {
+        g_glFramebufferTextureMultiview(target, attachment, texture, level, baseViewIndex, numViews);
+    }
+}
+
+JNIEXPORT void glFramebufferTexturesampleMultiview(GLenum target, GLenum attachment,
+        GLuint texture, GLint level, GLint baseViewIndex, GLsizei numViews) {
+    if (g_glFramebufferTextureSampleMultiview) {
+        g_glFramebufferTextureSampleMultiview(target, attachment, texture, level, baseViewIndex, numViews);
+    }
+}
+
 JNIEXPORT void* GetRenderEventFunc() {
     /* Return PVR's UnityRenderEvent so Unity can call it for TimeWarp */
     if (pvr.RenderEvent) return (void*)pvr.RenderEvent;
@@ -1275,7 +1711,17 @@ JNIEXPORT void JNICALL Java_com_pxr_xrlib_PicovrSDK_setEnableSinglePass(JNIEnv* 
 JNIEXPORT void JNICALL Java_com_pxr_xrlib_PicovrSDK_setGraphicOption(JNIEnv* env, jobject thiz, jint e) {}
 JNIEXPORT void JNICALL Java_com_pxr_xrlib_PicovrSDK_setPlatformOption(JNIEnv* env, jobject thiz, jint a, jint b) {}
 JNIEXPORT void JNICALL Java_com_pxr_xrlib_PicovrSDK_setPresentationFlag(JNIEnv* env, jobject thiz, jint e) {}
-JNIEXPORT void JNICALL Java_com_pxr_xrlib_PicovrSDK_setSwapchainEXT(JNIEnv* env, jobject thiz, jint e) {}
+JNIEXPORT void JNICALL Java_com_pxr_xrlib_PicovrSDK_setSwapchainEXT(JNIEnv* env, jobject thiz, jint e) {
+    LOGI("setSwapchainEXT(%d)", e);
+    /* Load GL multiview extension functions */
+    g_glFramebufferTextureMultiview = (PFNGLFRAMEBUFFERTEXTUREMULTIVIEWOVRPROC)eglGetProcAddress("glFramebufferTextureMultiviewOVR");
+    g_glFramebufferTextureSampleMultiview = (PFNGLFRAMEBUFFERTEXTURESAMPLEMULTIVIEWOVRPROC)eglGetProcAddress("glFramebufferTextureSampleMultiviewOVR");
+    if (!g_glFramebufferTextureMultiview)
+        g_glFramebufferTextureMultiview = (PFNGLFRAMEBUFFERTEXTUREMULTIVIEWOVRPROC)eglGetProcAddress("glFramebufferTextureMultiview");
+    if (!g_glFramebufferTextureSampleMultiview)
+        g_glFramebufferTextureSampleMultiview = (PFNGLFRAMEBUFFERTEXTURESAMPLEMULTIVIEWOVRPROC)eglGetProcAddress("glFramebufferTextureSampleMultiview");
+    LOGI("setSwapchainEXT: multiview=%p sampleMultiview=%p", g_glFramebufferTextureMultiview, g_glFramebufferTextureSampleMultiview);
+}
 JNIEXPORT void JNICALL Java_com_pxr_xrlib_PicovrSDK_ResetSensor(JNIEnv* env, jobject thiz, jint e) {
     if (pvr.ResetSensor) pvr.ResetSensor(0);
 }
