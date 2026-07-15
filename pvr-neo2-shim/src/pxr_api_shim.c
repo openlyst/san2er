@@ -124,6 +124,7 @@ static struct layer_info g_layers[MAX_LAYERS];
 
 static JavaVM* g_jvm = NULL;
 static int g_initialized = 0;
+static int g_runtime_initialized = 0;
 static int g_init_requested = 0;
 static int g_xr_running = 0;
 static int g_render_thread_inited = 0;
@@ -185,21 +186,115 @@ static void* hook_eglGetProcAddress(const char* procname) {
 static void wrapped_RenderEvent(int event);
 static UnityRenderEvent_t pvr_real_RenderEvent = NULL;
 
-/* ---- glBindFramebuffer hook via GOT patching ---- */
+/* ---- glBindFramebuffer hook via inline patching of libGLESv2.so ---- */
 static void (*real_glBindFramebuffer)(GLenum, GLuint) = NULL;
 static GLuint g_eye_fbo_2 = 0; /* unused, g_eye_fbo declared above */
+
+/* Original instructions of glBindFramebuffer stub (24 bytes max) */
+static unsigned char g_orig_glBindFB[32];
+static void* g_glBindFB_addr = NULL;
+static int g_inline_hook_installed = 0;
+
+/* Trampoline: executes original instructions then jumps back */
+static unsigned char g_trampoline[64];
 
 static void hook_glBindFramebuffer(GLenum target, GLuint fbo) {
     static int bind_log_count = 0;
     if (bind_log_count < 30) {
         LOGI("hook_glBindFramebuffer: target=0x%x fbo=%d redirect=%d eye_fbo=%d",
              target, fbo, g_redirect_fbo, g_eye_fbo);
+        {
+            char buf[128];
+            snprintf(buf, sizeof(buf), "hook_glBindFramebuffer: target=0x%x fbo=%d redirect=%d eye_fbo=%d",
+                     target, fbo, g_redirect_fbo, g_eye_fbo);
+            FLOG(buf);
+        }
         bind_log_count++;
     }
     if (g_redirect_fbo && fbo == 0 && target == GL_FRAMEBUFFER && g_eye_fbo) {
         real_glBindFramebuffer(target, g_eye_fbo);
     } else {
         real_glBindFramebuffer(target, fbo);
+    }
+}
+
+/* Install inline hook on glBindFramebuffer in libGLESv2.so.
+   The stub is:
+     mrs x16, tpidr_el0       ; d53bd050
+     ldr x16, [x16, #24]      ; f9400e10
+     cbz x16, +12             ; b4000070
+     ldr x16, [x16, #168]     ; f9405610
+     br  x16                  ; d61f0200
+     ret                      ; d65f03c0
+   We overwrite first 16 bytes with:
+     ldr x16, [pc, #8]        ; 58000050
+     br  x16                  ; d61f0200
+     .quad hook_addr
+   The trampoline has the original 24 bytes + a branch back to addr+16. */
+static void install_inline_hook() {
+    void* handle = dlopen("libGLESv2.so", RTLD_NOW);
+    if (!handle) {
+        FLOG("install_inline_hook: dlopen libGLESv2.so failed");
+        return;
+    }
+    void* sym = dlsym(handle, "glBindFramebuffer");
+    dlclose(handle);
+    if (!sym) {
+        FLOG("install_inline_hook: glBindFramebuffer not found");
+        return;
+    }
+    g_glBindFB_addr = sym;
+    real_glBindFramebuffer = (void(*)(GLenum, GLuint))sym;
+
+    /* Save original bytes */
+    memcpy(g_orig_glBindFB, sym, 24);
+
+    /* Build trampoline: copy original 24 bytes, then add branch back */
+    memcpy(g_trampoline, g_orig_glBindFB, 24);
+    /* After the original stub code, branch back to original+24 */
+    /* But the stub is self-contained (it branches to the real impl),
+       so we don't need to branch back. The trampoline IS the original stub. */
+    /* Make trampoline executable */
+    uintptr_t tpage = (uintptr_t)g_trampoline & ~0xFFF;
+    mprotect((void*)tpage, 0x2000, PROT_READ | PROT_WRITE | PROT_EXEC);
+    /* Flush instruction cache for trampoline */
+    __builtin___clear_cache((char*)g_trampoline, (char*)g_trampoline + 64);
+
+    /* Set real_glBindFramebuffer to the trampoline */
+    real_glBindFramebuffer = (void(*)(GLenum, GLuint))g_trampoline;
+
+    /* Overwrite original function with jump to our hook */
+    uintptr_t page = (uintptr_t)sym & ~0xFFF;
+    mprotect((void*)page, 0x2000, PROT_READ | PROT_WRITE | PROT_EXEC);
+
+    unsigned int* code = (unsigned int*)sym;
+    /* ldr x16, [pc, #8]  ->  0x58000050
+       br x16             ->  0xd61f0200 */
+    code[0] = 0x58000050;  /* ldr x16, [pc, #8] */
+    code[1] = 0xd61f0200;  /* br x16 */
+    /* Write hook function address at offset +8 */
+    void** addr_slot = (void**)((char*)sym + 8);
+    addr_slot[0] = (void*)hook_glBindFramebuffer;
+
+    /* Flush instruction cache */
+    __builtin___clear_cache((char*)sym, (char*)sym + 16);
+
+    /* Verify the overwrite succeeded */
+    unsigned int* verify = (unsigned int*)sym;
+    if (verify[0] == 0x58000050 && verify[1] == 0xd61f0200) {
+        g_inline_hook_installed = 1;
+        char buf[256];
+        snprintf(buf, sizeof(buf), "install_inline_hook: hooked glBindFramebuffer at %p -> %p (verified)",
+                 sym, (void*)hook_glBindFramebuffer);
+        FLOG(buf);
+    } else {
+        char buf[256];
+        snprintf(buf, sizeof(buf), "install_inline_hook: OVERWRITE FAILED! code=%08x %08x",
+                 verify[0], verify[1]);
+        FLOG(buf);
+        /* Restore original */
+        memcpy(sym, g_orig_glBindFB, 24);
+        __builtin___clear_cache((char*)sym, (char*)sym + 24);
     }
 }
 
@@ -250,10 +345,13 @@ static int patch_got_callback(struct dl_phdr_info* info, size_t size, void* data
 
     Elf64_Sym* symtab = NULL;
     const char* strtab = NULL;
-    Elf64_Rel* rel = NULL;
-    size_t relsz = 0, relent = 0;
+    /* On ARM64, both DT_JMPREL (PLT) and DT_RELA use RELA entries.
+       Scan both tables. */
+    Elf64_Rela* jmprela = NULL;
+    size_t jmprelasz = 0;
     Elf64_Rela* rela = NULL;
-    size_t relasz = 0, relaent = 0;
+    size_t relasz = 0;
+    size_t relaent = 0;
 
     for (int i = 0; i < info->dlpi_phnum; i++) {
         const Elf64_Phdr* phdr = &info->dlpi_phdr[i];
@@ -263,12 +361,11 @@ static int patch_got_callback(struct dl_phdr_info* info, size_t size, void* data
                 switch (d->d_tag) {
                 case DT_SYMTAB: symtab = (Elf64_Sym*)(info->dlpi_addr + d->d_un.d_ptr); break;
                 case DT_STRTAB: strtab = (const char*)(info->dlpi_addr + d->d_un.d_ptr); break;
-                case DT_JMPREL: rel = (Elf64_Rel*)(info->dlpi_addr + d->d_un.d_ptr); break;
-                case DT_PLTRELSZ: relsz = d->d_un.d_val; break;
+                case DT_JMPREL: jmprela = (Elf64_Rela*)(info->dlpi_addr + d->d_un.d_ptr); break;
+                case DT_PLTRELSZ: jmprelasz = d->d_un.d_val; break;
                 case DT_RELA: rela = (Elf64_Rela*)(info->dlpi_addr + d->d_un.d_ptr); break;
                 case DT_RELASZ: relasz = d->d_un.d_val; break;
                 case DT_RELAENT: relaent = d->d_un.d_val; break;
-                case DT_RELENT: relent = d->d_un.d_val; break;
                 }
             }
             break;
@@ -276,11 +373,12 @@ static int patch_got_callback(struct dl_phdr_info* info, size_t size, void* data
     }
     if (!symtab || !strtab) return 0;
 
-    if (rel && relsz > 0) {
-        size_t ent = relent ? relent : sizeof(Elf64_Rel);
-        int count = relsz / ent;
+    size_t ent = relaent ? relaent : sizeof(Elf64_Rela);
+    /* Scan PLT relocations first (where eglGetProcAddress, eglSwapBuffers live) */
+    if (jmprela && jmprelasz > 0) {
+        int count = jmprelasz / ent;
         for (int j = 0; j < count; j++) {
-            Elf64_Rel* r = (Elf64_Rel*)((char*)rel + j * ent);
+            Elf64_Rela* r = (Elf64_Rela*)((char*)jmprela + j * ent);
             int symidx = ELF64_R_SYM(r->r_info);
             Elf64_Sym* sym = &symtab[symidx];
             const char* symname = strtab + sym->st_name;
@@ -291,15 +389,21 @@ static int patch_got_callback(struct dl_phdr_info* info, size_t size, void* data
                 if (*got_entry != g_patch_hook_fn) {
                     *g_patch_real_fn = *got_entry;
                     *got_entry = g_patch_hook_fn;
-                    LOGI("Hooked %s in %s (GOT %p -> %p)", g_patch_sym_name, name, got_entry, g_patch_hook_fn);
+                    LOGI("Hooked %s in %s (PLT GOT %p -> %p)", g_patch_sym_name, name, got_entry, g_patch_hook_fn);
+                    {
+                        char buf[256];
+                        snprintf(buf, sizeof(buf), "patch_got: Hooked %s in %s GOT=%p",
+                                 g_patch_sym_name, name, got_entry);
+                        FLOG(buf);
+                    }
                     g_patch_found = 1;
                 }
-                return 0; /* continue to next library */
+                return 0;
             }
         }
     }
+    /* Then scan non-PLT relocations */
     if (rela && relasz > 0) {
-        size_t ent = relaent ? relaent : sizeof(Elf64_Rela);
         int count = relasz / ent;
         for (int j = 0; j < count; j++) {
             Elf64_Rela* r = (Elf64_Rela*)((char*)rela + j * ent);
@@ -314,9 +418,15 @@ static int patch_got_callback(struct dl_phdr_info* info, size_t size, void* data
                     *g_patch_real_fn = *got_entry;
                     *got_entry = g_patch_hook_fn;
                     LOGI("Hooked %s in %s (RELA GOT %p)", g_patch_sym_name, name, got_entry);
+                    {
+                        char buf[256];
+                        snprintf(buf, sizeof(buf), "patch_got: Hooked(RELA) %s in %s GOT=%p",
+                                 g_patch_sym_name, name, got_entry);
+                        FLOG(buf);
+                    }
                     g_patch_found = 1;
                 }
-                return 0; /* continue to next library */
+                return 0;
             }
         }
     }
@@ -436,7 +546,138 @@ static void install_swap_hook() {
             FLOG("install_swap_hook: eglSwapBuffers hook installed");
         }
     }
+    /* Inline-hook glBindFramebuffer in libGLESv2.so. This is the most reliable
+       way to intercept GL calls because Unity loads GL funcs via eglGetProcAddress
+       and caches the pointers, bypassing GOT/PLT. Inline patching overwrites the
+       actual function code so ALL callers go through our hook. */
+    install_inline_hook();
     g_swap_hook_installed = 1;
+}
+
+/* ---- IL2CPP runtime API for calling C# methods ---- */
+typedef struct Il2CppDomain Il2CppDomain;
+typedef struct Il2CppAssembly Il2CppAssembly;
+typedef struct Il2CppImage Il2CppImage;
+typedef struct Il2CppClass Il2CppClass;
+typedef struct MethodInfo MethodInfo;
+typedef struct Il2CppException Il2CppException;
+typedef struct Il2CppArray Il2CppArray;
+
+static Il2CppDomain* (*p_il2cpp_domain_get)(void);
+static const Il2CppAssembly* const* (*p_il2cpp_domain_get_assemblies)(Il2CppDomain*, size_t*);
+static const Il2CppImage* (*p_il2cpp_assembly_get_image)(const Il2CppAssembly*);
+static Il2CppClass* (*p_il2cpp_class_from_name)(const Il2CppImage*, const char*, const char*);
+static const MethodInfo* (*p_il2cpp_class_get_method_from_name)(Il2CppClass*, const char*, int);
+static void (*p_il2cpp_runtime_invoke)(const MethodInfo*, void*, void**, Il2CppException**);
+static Il2CppClass* (*p_il2cpp_image_get_class)(const Il2CppImage*, size_t);
+static size_t (*p_il2cpp_image_get_class_count)(const Il2CppImage*);
+static void* (*p_il2cpp_thread_attach)(Il2CppDomain*);
+
+static int g_il2cpp_loaded = 0;
+static int g_xr_init_called = 0;
+
+static void load_il2cpp_api() {
+    if (g_il2cpp_loaded) return;
+    void* h = dlopen("libil2cpp.so", RTLD_NOW);
+    if (!h) {
+        FLOG("load_il2cpp_api: dlopen libil2cpp.so failed");
+        return;
+    }
+    p_il2cpp_domain_get = dlsym(h, "il2cpp_domain_get");
+    p_il2cpp_domain_get_assemblies = dlsym(h, "il2cpp_domain_get_assemblies");
+    p_il2cpp_assembly_get_image = dlsym(h, "il2cpp_assembly_get_image");
+    p_il2cpp_class_from_name = dlsym(h, "il2cpp_class_from_name");
+    p_il2cpp_class_get_method_from_name = dlsym(h, "il2cpp_class_get_method_from_name");
+    p_il2cpp_runtime_invoke = dlsym(h, "il2cpp_runtime_invoke");
+    p_il2cpp_image_get_class = dlsym(h, "il2cpp_image_get_class");
+    p_il2cpp_image_get_class_count = dlsym(h, "il2cpp_image_get_class_count");
+    p_il2cpp_thread_attach = dlsym(h, "il2cpp_thread_attach");
+    if (p_il2cpp_domain_get && p_il2cpp_class_from_name && p_il2cpp_class_get_method_from_name && p_il2cpp_runtime_invoke) {
+        g_il2cpp_loaded = 1;
+        FLOG("load_il2cpp_api: IL2CPP runtime API loaded");
+    } else {
+        FLOG("load_il2cpp_api: missing functions");
+    }
+}
+
+/* Call a static C# method with no parameters.
+   Returns 1 on success, 0 on failure. */
+static int call_csharp_static(const char* assembly_name, const char* ns, const char* class_name, const char* method_name) {
+    if (!g_il2cpp_loaded) return 0;
+    Il2CppDomain* domain = p_il2cpp_domain_get();
+    if (!domain) {
+        FLOG("call_csharp: domain is null");
+        return 0;
+    }
+    size_t count = 0;
+    const Il2CppAssembly* const* assemblies = p_il2cpp_domain_get_assemblies(domain, &count);
+    if (!assemblies) {
+        FLOG("call_csharp: assemblies is null");
+        return 0;
+    }
+    for (size_t i = 0; i < count; i++) {
+        const Il2CppImage* img = p_il2cpp_assembly_get_image(assemblies[i]);
+        if (!img) continue;
+        Il2CppClass* klass = p_il2cpp_class_from_name(img, ns, class_name);
+        if (klass) {
+            const MethodInfo* method = p_il2cpp_class_get_method_from_name(klass, method_name, 0);
+            if (method) {
+                Il2CppException* exc = NULL;
+                p_il2cpp_runtime_invoke(method, NULL, NULL, &exc);
+                if (exc) {
+                    char buf[256];
+                    snprintf(buf, sizeof(buf), "call_csharp: %s.%s.%s threw exception", ns, class_name, method_name);
+                    FLOG(buf);
+                } else {
+                    char buf[256];
+                    snprintf(buf, sizeof(buf), "call_csharp: called %s.%s.%s (assembly %zu)", ns, class_name, method_name, i);
+                    FLOG(buf);
+                    return 1;
+                }
+            } else {
+                char buf[256];
+                snprintf(buf, sizeof(buf), "call_csharp: method %s not found in %s.%s (assembly %zu)", method_name, ns, class_name, i);
+                FLOG(buf);
+            }
+        }
+    }
+    char buf[256];
+    snprintf(buf, sizeof(buf), "call_csharp: class %s.%s not found in any assembly", ns, class_name);
+    FLOG(buf);
+    return 0;
+}
+
+/* Call the XR initialization methods that are normally triggered by
+   RuntimeInitializeOnLoadMethod(BeforeSplashScreen). In VR mode, the
+   splash screen is skipped so these never fire. We call them manually. */
+static void trigger_xr_init() {
+    if (g_xr_init_called) return;
+    g_xr_init_called = 1;
+    load_il2cpp_api();
+    if (!g_il2cpp_loaded) {
+        FLOG("trigger_xr_init: IL2CPP API not loaded, skipping");
+        return;
+    }
+    /* Attach current thread to IL2CPP runtime (we're on the render thread) */
+    Il2CppDomain* domain = p_il2cpp_domain_get();
+    if (!domain) {
+        FLOG("trigger_xr_init: domain is null");
+        return;
+    }
+    if (p_il2cpp_thread_attach) {
+        p_il2cpp_thread_attach(domain);
+        FLOG("trigger_xr_init: thread attached");
+    }
+    /* Call XRGeneralSettings.AttemptInitializeXRSDKOnLoad first.
+       This initializes the XR loader. Without it, StartSDK does nothing. */
+    call_csharp_static("Unity.XR.Management", "UnityEngine.XR.Management", "XRGeneralSettings", "AttemptInitializeXRSDKOnLoad");
+    /* Call XRGeneralSettings.AttemptStartXRSDKOnBeforeSplashScreen
+       This starts the XR SDK (display subsystem, input subsystem) */
+    call_csharp_static("Unity.XR.Management", "UnityEngine.XR.Management", "XRGeneralSettings", "AttemptStartXRSDKOnBeforeSplashScreen");
+    /* Call XRSystem.XRSystemInit
+       This initializes URP's XR rendering system */
+    call_csharp_static("Unity.RenderPipelines.Universal.Runtime", "UnityEngine.Rendering.Universal", "XRSystem", "XRSystemInit");
+    FLOG("trigger_xr_init: done");
 }
 
 /* GL multiview extension function pointers */
@@ -691,9 +932,9 @@ static jobject get_unity_activity(JNIEnv* env) {
 }
 
 static void init_pvr_runtime(JNIEnv* env) {
-    if (g_initialized) return;
+    if (g_runtime_initialized) return;
     pthread_mutex_lock(&g_lock);
-    if (g_initialized) {
+    if (g_runtime_initialized) {
         pthread_mutex_unlock(&g_lock);
         return;
     }
@@ -758,6 +999,7 @@ static void init_pvr_runtime(JNIEnv* env) {
        We'll call it on the first Pxr_EndFrame instead. */
 
     g_initialized = 1;
+    g_runtime_initialized = 1;
     pthread_mutex_unlock(&g_lock);
 }
 
@@ -778,18 +1020,19 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* reserved) {
     LOGI("GL multiview: %p %p", g_glFramebufferTextureMultiview, g_glFramebufferTextureSampleMultiview);
 
     /* If Pxr_Initialize was called before JNI_OnLoad (it is, since
-       libPxrPlatform.so loads us as a dependency), do the init now. */
-    if (g_init_requested && !g_initialized) {
-        FLOG("JNI_OnLoad: init_requested but not initialized, calling init_pvr_runtime");
+       libPxrPlatform.so loads us as a dependency), do the runtime init now.
+       g_initialized may already be 1 (set by Pxr_Initialize to let the
+       display subsystem proceed), but g_runtime_initialized is still 0
+       because the PVR runtime needs JNI. */
+    if (g_init_requested && !g_runtime_initialized) {
+        FLOG("JNI_OnLoad: init_requested, calling init_pvr_runtime");
         JNIEnv* env = NULL;
         if ((*vm)->GetEnv(vm, (void**)&env, JNI_VERSION_1_6) == JNI_OK) {
             init_pvr_runtime(env);
-            FLOG("JNI_OnLoad: init_pvr_runtime done, g_initialized=1?");
+            FLOG("JNI_OnLoad: init_pvr_runtime done");
         } else {
             FLOG("JNI_OnLoad: GetEnv failed");
         }
-    } else {
-        FLOG("JNI_OnLoad: init_requested but g_initialized check");
     }
     FLOG("JNI_OnLoad done");
 
@@ -911,8 +1154,12 @@ JNIEXPORT int Pxr_Initialize() {
     } else {
         /* JNI_OnLoad hasn't been called yet. The init will be deferred
            to JNI_OnLoad. This is expected when libPxrPlatform.so loads
-           us as a dependency before the Java runtime registers us. */
-        FLOG("Pxr_Initialize: no JNIEnv yet, deferring to JNI_OnLoad");
+           us as a dependency before the Java runtime registers us.
+           Mark as initialized anyway so the display subsystem proceeds
+           with rendering. The PVR runtime will be fully initialized
+           in JNI_OnLoad. */
+        g_initialized = 1;
+        FLOG("Pxr_Initialize: no JNIEnv yet, marked initialized, deferring runtime init to JNI_OnLoad");
         LOGW("Pxr_Initialize: no JNIEnv yet, deferring to JNI_OnLoad");
     }
     return 0;
@@ -1635,6 +1882,12 @@ JNIEXPORT int Pxr_GetFov(int eye, float* fovLeft, float* fovRight,
     if (fovRight) *fovRight = g_fov_right;
     if (fovUp) *fovUp = g_fov_up;
     if (fovDown) *fovDown = g_fov_down;
+    {
+        char buf[256];
+        snprintf(buf, sizeof(buf), "Pxr_GetFov -> L=%f R=%f U=%f D=%f",
+            g_fov_left, g_fov_right, g_fov_up, g_fov_down);
+        FLOG(buf);
+    }
     return 0;
 }
 
@@ -1810,6 +2063,13 @@ JNIEXPORT int Pxr_GetAppHasFocus() { LOGI("Pxr_GetAppHasFocus -> 1"); FLOG("Pxr_
 JNIEXPORT int Pxr_GetTrackingState() { LOGI("Pxr_GetTrackingState -> 1"); FLOG("Pxr_GetTrackingState"); return 1; }
 JNIEXPORT int Pxr_PollEvent(void* event) {
     static int poll_count = 0;
+    /* Trigger XR initialization after a few frames to ensure IL2CPP
+       assemblies are loaded. BeforeSplashScreen never fires in VR mode
+       so AttemptStartXRSDKOnBeforeSplashScreen and XRSystemInit are
+       never called by Unity. We call them manually. */
+    if (poll_count == 3 && !g_xr_init_called) {
+        trigger_xr_init();
+    }
     if (g_render_thread_inited && pvr.RenderEvent) {
         /* Blit Unity's rendered output to the eye texture at the START
            of Pxr_PollEvent. Unity renders between Pxr_PollEvent calls,
@@ -1818,10 +2078,54 @@ JNIEXPORT int Pxr_PollEvent(void* event) {
         if (poll_count > 0) {
             int any_in_use = 0;
             for (int i = 0; i < MAX_LAYERS; i++) any_in_use += g_layers[i].in_use;
-            LOGI("Pxr_PollEvent: blit phase poll_count=%d layers_in_use=%d", poll_count, any_in_use);
+            static int reach_log = 0;
+            if (reach_log < 3) {
+                char buf[128];
+                snprintf(buf, sizeof(buf), "EYECHECK reach: poll_count=%d any_in_use=%d", poll_count, any_in_use);
+                FLOG(buf);
+                reach_log++;
+            }
+
+            /* Check what FBO Unity rendered to. Unity uses FBO 2 for rendering
+               (not FBO 0), so we need to blit from FBO 2 to the eye texture. */
+            static int s_unity_fbo = -1;
+            {
+                GLint curFbo = 0;
+                glGetIntegerv(GL_FRAMEBUFFER_BINDING, &curFbo);
+                static int fb_log = 0;
+                if (fb_log < 5) {
+                    /* Check FBO 2 content */
+                    unsigned char pix[4] = {0};
+                    GLint prevFbo = 0;
+                    glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &prevFbo);
+                    glBindFramebuffer(GL_READ_FRAMEBUFFER, 2);
+                    glReadPixels(512, 512, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, pix);
+                    char buf[256];
+                    snprintf(buf, sizeof(buf),
+                        "Pxr_PollEvent: FBO 2 pixel=%d,%d,%d,%d (curFbo=%d)",
+                        pix[0], pix[1], pix[2], pix[3], curFbo);
+                    FLOG(buf);
+                    /* Also check FBO 0 */
+                    glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+                    glReadPixels(512, 512, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, pix);
+                    snprintf(buf, sizeof(buf),
+                        "Pxr_PollEvent: FBO 0 pixel=%d,%d,%d,%d",
+                        pix[0], pix[1], pix[2], pix[3]);
+                    FLOG(buf);
+                    /* Check FBO 1 */
+                    glBindFramebuffer(GL_READ_FRAMEBUFFER, 1);
+                    glReadPixels(512, 512, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, pix);
+                    snprintf(buf, sizeof(buf),
+                        "Pxr_PollEvent: FBO 1 pixel=%d,%d,%d,%d",
+                        pix[0], pix[1], pix[2], pix[3]);
+                    FLOG(buf);
+                    glBindFramebuffer(GL_READ_FRAMEBUFFER, prevFbo);
+                    fb_log++;
+                }
+            }
+
             for (int i = 0; i < MAX_LAYERS; i++) {
                 if (g_layers[i].in_use) {
-                    LOGI("Pxr_PollEvent: blit START i=%d", i);
                     GLuint tex = g_layers[i].textures[0];
                     int w = g_layers[i].width;
                     int h = g_layers[i].height;
@@ -1830,26 +2134,9 @@ JNIEXPORT int Pxr_PollEvent(void* event) {
                     glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &prevReadFbo);
                     glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &prevDrawFbo);
 
-                    GLuint tmpFbo = 0;
-                    glGenFramebuffers(1, &tmpFbo);
-                    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, tmpFbo);
-                    /* tex is a GL_TEXTURE_2D_ARRAY (multiview). Use
-                       glFramebufferTextureLayer to attach layer 0. */
-                    glFramebufferTextureLayer(GL_DRAW_FRAMEBUFFER,
-                        GL_COLOR_ATTACHMENT0, tex, 0, 0);
-
-                    /* Read from Unity's current FBO */
-                    glBindFramebuffer(GL_READ_FRAMEBUFFER, prevFbo);
-
-                    static int blit_log = 0;
-                    if (blit_log < 200) {
-                        unsigned char pix[4] = {0};
-                        /* Check Unity's current FBO */
-                        glBindFramebuffer(GL_READ_FRAMEBUFFER, prevFbo);
-                        glReadPixels(w/2, h/2, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, pix);
-                        LOGI("PollEvent blit: srcFbo=%d tex=%d pix=%d,%d,%d,%d w=%d h=%d",
-                             prevFbo, tex, pix[0], pix[1], pix[2], pix[3], w, h);
-                        /* Check eye texture content directly */
+                    /* Check what Unity rendered to the eye texture */
+                    static int check_log = 0;
+                    if (check_log < 10 || (check_log % 300) == 0) {
                         GLuint checkFbo = 0;
                         glGenFramebuffers(1, &checkFbo);
                         glBindFramebuffer(GL_READ_FRAMEBUFFER, checkFbo);
@@ -1857,25 +2144,24 @@ JNIEXPORT int Pxr_PollEvent(void* event) {
                             GL_COLOR_ATTACHMENT0, tex, 0, 0);
                         GLenum st = glCheckFramebufferStatus(GL_READ_FRAMEBUFFER);
                         if (st == GL_FRAMEBUFFER_COMPLETE) {
+                            unsigned char pix[4] = {0};
                             glReadPixels(w/2, h/2, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, pix);
-                            LOGI("PollEvent eye tex: tex=%d pix=%d,%d,%d,%d", tex, pix[0], pix[1], pix[2], pix[3]);
+                            unsigned char pix2[4] = {0};
+                            glReadPixels(10, 10, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, pix2);
+                            char buf[256];
+                            snprintf(buf, sizeof(buf),
+                                "EYECHECK[%d]: center=%d,%d,%d,%d corner=%d,%d,%d,%d",
+                                 check_log, pix[0], pix[1], pix[2], pix[3],
+                                 pix2[0], pix2[1], pix2[2], pix2[3]);
+                            FLOG(buf);
                         }
                         glDeleteFramebuffers(1, &checkFbo);
-                        glBindFramebuffer(GL_READ_FRAMEBUFFER, prevFbo);
-                        blit_log++;
-                    }
-
-                    GLenum srcSt = glCheckFramebufferStatus(GL_READ_FRAMEBUFFER);
-                    GLenum dstSt = glCheckFramebufferStatus(GL_DRAW_FRAMEBUFFER);
-                    if (srcSt == GL_FRAMEBUFFER_COMPLETE && dstSt == GL_FRAMEBUFFER_COMPLETE) {
-                        glBlitFramebuffer(0, 0, w, h, 0, 0, w, h,
-                                          GL_COLOR_BUFFER_BIT, GL_LINEAR);
+                        check_log++;
                     }
 
                     glBindFramebuffer(GL_READ_FRAMEBUFFER, prevReadFbo);
                     glBindFramebuffer(GL_DRAW_FRAMEBUFFER, prevDrawFbo);
                     glBindFramebuffer(GL_FRAMEBUFFER, prevFbo);
-                    glDeleteFramebuffers(1, &tmpFbo);
                     break;
                 }
             }
